@@ -1,8 +1,10 @@
 import json
+from types import SimpleNamespace
 
 import pytest
 
 from emotionscreen.config import ConfigError, load_config
+from emotionscreen.ui.window import EmotionWindow
 from emotionscreen.ui.glass import apply_glass, emotion_palette, interpolate_color, should_reduce_motion
 
 
@@ -43,3 +45,36 @@ def test_glass_theme_color_interpolates_between_emotion_endpoints():
     assert interpolate_color("#102030", "#90A0B0", 1.0) == "#90A0B0"
     assert emotion_palette("low_arousal").start != emotion_palette("elevated").start
     assert emotion_palette("unknown").start == emotion_palette("uncertain").start
+
+
+def test_live_listening_restores_missing_overlay_but_respects_manual_dismissal():
+    class Overlay:
+        visible = False
+        persistent = False
+
+        def __init__(self):
+            self.shown = []
+
+        def show_audio_state(self, state, language):
+            self.shown.append((state, language))
+            self.visible = True
+            self.persistent = True
+
+    app = SimpleNamespace(
+        config=SimpleNamespace(mode="live"),
+        _listening=True,
+        _paused=False,
+        _dnd=False,
+        _audio_overlay_dismissed=False,
+        _audio_state="elevated",
+        _language="zh-CN",
+        comfort=Overlay(),
+    )
+
+    EmotionWindow._ensure_live_audio_overlay(app)
+    assert app.comfort.shown == [("elevated", "zh-CN")]
+
+    app.comfort.visible = False
+    app._audio_overlay_dismissed = True
+    EmotionWindow._ensure_live_audio_overlay(app)
+    assert app.comfort.shown == [("elevated", "zh-CN")]

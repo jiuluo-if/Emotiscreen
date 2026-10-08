@@ -249,6 +249,18 @@ class EmotionWindow:
             label = text("mock_mode" if self._provider_name == "mock" else "clef_mode", self._language)
         self.provider_status_var.set(f"{label} · {count}")
 
+    def _ensure_live_audio_overlay(self) -> None:
+        if (
+            self.config.mode != "live"
+            or not self._listening
+            or self._paused
+            or self._dnd
+            or self._audio_overlay_dismissed
+        ):
+            return
+        if not self.comfort.visible or not self.comfort.persistent:
+            self.comfort.show_audio_state(self._audio_state, self._language)
+
     def _schedule_tick(self) -> None:
         if not self._closed:
             self._after_id = self.root.after(33, self._tick)
@@ -362,6 +374,7 @@ class EmotionWindow:
                 self.provider_var.set("mock")
                 self._change_provider()
             self.api_var.set(status)
+        self._ensure_live_audio_overlay()
         self._schedule_tick()
 
     def _maybe_submit_audio(self) -> None:
