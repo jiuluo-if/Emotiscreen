@@ -1,272 +1,609 @@
-"""Small Tkinter UI for the mock/live demo."""
+"""主控制窗口：简洁控制 + 可选开发面板。"""
 
 from __future__ import annotations
 
-import time
 import tkinter as tk
-from tkinter import messagebox, ttk
-from dataclasses import replace
+from tkinter import ttk
+from pathlib import Path
+import time
 
 import numpy as np
 
 from ..config import AppConfig
-from ..core.audio import AudioRingBuffer, MockAudioInput, SoundDeviceAudioInput
-from ..core.controller import ReactionController
+from ..core.acoustic import AudioStateTracker
+from ..core.audio import AudioRingBuffer, SoundDeviceAudioInput, load_pcm_wav
+from ..core.audio_policy import AudioFeedbackPolicy
+from ..core.audio_runtime import AudioAnalysisWorker
+from ..core.context import ConversationContext
 from ..core.decision import ClefDecisionProvider, MockDecisionProvider
-from ..core.features import FeatureExtractor
-from ..core.models import AcousticFeatures, DecisionResult, EMOTIONS, VisualState
-from ..core.runtime import SingleFlightDecider
-from ..core.smoothing import EmotionSmoother
+from ..core.i18n import text
+from ..core.models import DecisionResult, ResponseEvent, TranscriptSegment
+from ..core.policy import ResponsePolicy
+from ..core.runtime import ConversationRuntime
+from ..core.transcript import MockTranscriptProvider
+from .comfort_window import ComfortWindow
+from .glass import should_reduce_motion
+
+
+_SCENARIOS = (
+    "user_achievement", "user_praise", "user_sadness", "small_progress", "ordinary_chat",
+    "sarcasm", "other_person", "incomplete", "uncertain",
+)
+
+
+def _rounded_rectangle(canvas, x1: float, y1: float, x2: float, y2: float, radius: float, fill: str, outline: str = "") -> int:
+    points = [
+        x1 + radius, y1, x2 - radius, y1, x2, y1, x2, y1 + radius,
+        x2, y2 - radius, x2, y2, x2 - radius, y2, x1 + radius, y2,
+        x1, y2, x1, y2 - radius, x1, y1 + radius, x1, y1,
+    ]
+    return canvas.create_polygon(points, smooth=True, splinesteps=16, fill=fill, outline=outline, width=1)
 
 
 class EmotionWindow:
-    def __init__(self, config: AppConfig) -> None:
+    def __init__(self, config: AppConfig, *, audio_file: Path | None = None) -> None:
         self.config = config
         self.root = tk.Tk()
-        self.root.title("EmotionScreen — voice visualization demo")
-        self.root.geometry("820x650")
-        self.root.minsize(680, 540)
-        self._running = False
+        screen_height = self.root.winfo_screenheight()
+        window_height = max(620, min(820, screen_height - 90))
+        self.root.geometry(f"820x{window_height}")
+        self.root.minsize(660, min(680, window_height))
         self._closed = False
         self._after_id: str | None = None
-        self._last_feature_at = 0.0
-        self._last_decision_at = 0.0
-        self._features = AcousticFeatures(sample_rate=config.audio.sample_rate)
-        self._visual_state = VisualState()
-        self._configure_mode(config.mode)
-        self._build_widgets()
-        self.root.protocol("WM_DELETE_WINDOW", self.close)
-        self._schedule()
-
-    def _configure_mode(self, mode: str) -> None:
-        if hasattr(self, "audio"):
-            try:
-                self.audio.stop()
-            except Exception:
-                pass
-        if hasattr(self, "decider"):
-            self.decider.close()
-        provider_name = "mock" if mode == "mock" else "clef"
-        self.config = replace(self.config, mode=mode, decision=replace(self.config.decision, provider=provider_name))
-        if mode == "mock":
-            self.audio = MockAudioInput(self.config.audio.sample_rate, self.config.audio.frame_ms, self.config.decision.seed)
-            provider = MockDecisionProvider(seed=self.config.decision.seed)
-        else:
-            self.audio = SoundDeviceAudioInput(
-                self.config.audio.sample_rate, self.config.audio.frame_ms,
-                self.config.audio.device, self.config.audio.channels,
-            )
-            provider = ClefDecisionProvider(
-                self.config.decision.clef_base_url, timeout_seconds=self.config.decision.timeout_seconds,
-            )
-        self.buffer = AudioRingBuffer(round(self.config.audio.sample_rate * self.config.audio.window_seconds))
-        self.extractor = FeatureExtractor()
-        self.decider = SingleFlightDecider(provider)
-        self.smoother = EmotionSmoother(
-            alpha=self.config.emotion.smoothing_alpha,
-            min_hold_seconds=self.config.emotion.min_hold_ms / 1000,
-            confirm_count=self.config.emotion.confirm_count,
-            uncertain_fallback=self.config.emotion.uncertain_fallback,
+        self._listening = False
+        self._paused = False
+        self._dnd = False
+        self._developer_mode = False
+        self._provider_name = "mock" if config.mode == "live" else config.decision.provider
+        self._language = config.ui.language
+        self._theme = "light" if config.ui.theme == "system" else config.ui.theme
+        self._static = config.ui.reduced_motion or should_reduce_motion()
+        self._motion_strength = config.ui.motion_strength
+        self._preview_action = "support"
+        self._audio: SoundDeviceAudioInput | None = None
+        self._audio_buffer: AudioRingBuffer | None = None
+        self._audio_worker: AudioAnalysisWorker | None = None
+        self._audio_states = AudioStateTracker(confirmations=2)
+        self._last_audio_submit = 0.0
+        self._audio_file_preview = False
+        self._transcripts = MockTranscriptProvider()
+        self._context = ConversationContext(max_turns=config.context.max_turns)
+        self._policy = ResponsePolicy(
+            cooldown_seconds={
+                "celebrate": config.response.celebrate_cooldown_seconds,
+                "support": config.response.support_cooldown_seconds,
+                "acknowledge": config.response.acknowledge_cooldown_seconds,
+            },
+            dedupe_seconds=config.response.dedupe_seconds,
+            duration_seconds=config.response.duration_seconds,
         )
-        self.controller = ReactionController()
-        self._last_decision_at = 0.0
+        self._audio_policy = AudioFeedbackPolicy(
+            cooldown_seconds=config.response.support_cooldown_seconds,
+            dedupe_seconds=config.response.dedupe_seconds,
+            duration_seconds=config.response.duration_seconds,
+        )
+        self.runtime = self._new_runtime(self._provider_name)
+        self._build_ui()
+        # Map the main window first so the initially withdrawn toast cannot become the first active top-level.
+        self.root.update_idletasks()
+        self.root.update()
+        self.comfort = ComfortWindow(
+            self.root,
+            language=self._language,
+            reduced_motion=self._static,
+            motion_strength=self._motion_strength,
+            theme=self._theme,
+        )
+        self.root.protocol("WM_DELETE_WINDOW", self.close)
+        self._apply_theme()
+        self._refresh_text()
+        self._schedule_tick()
+        if audio_file is not None:
+            self.root.after(250, lambda: self.analyze_audio_file(audio_file))
 
-    def _build_widgets(self) -> None:
-        outer = ttk.Frame(self.root, padding=18)
+    def _new_runtime(self, provider_name: str) -> ConversationRuntime:
+        provider = (
+            ClefDecisionProvider(self.config.decision.clef_base_url, timeout_seconds=self.config.decision.timeout_seconds)
+            if provider_name == "clef"
+            else MockDecisionProvider()
+        )
+        return ConversationRuntime(provider, context=self._context, policy=self._policy)
+
+    def _build_ui(self) -> None:
+        self.style = ttk.Style(self.root)
+        try:
+            self.style.theme_use("clam")
+        except tk.TclError:
+            pass
+        self.style.configure("Title.TLabel", font=("Microsoft YaHei UI", 24, "bold"))
+        self.style.configure("Tagline.TLabel", foreground="#687486")
+        self.style.configure("Eyebrow.TLabel", font=("Segoe UI", 8, "bold"), foreground="#74839A")
+        self.style.configure("Primary.TButton", font=("Microsoft YaHei UI", 10, "bold"), padding=(18, 11), borderwidth=0)
+        self.style.configure("Soft.TButton", font=("Microsoft YaHei UI", 10), padding=(14, 10), borderwidth=0)
+        self.style.configure("Stage.TFrame", padding=14, borderwidth=0)
+        self.widgets: dict[str, tk.Widget] = {}
+        outer = ttk.Frame(self.root, padding=(30, 26, 30, 22))
         outer.pack(fill="both", expand=True)
-        ttk.Label(outer, text="EmotionScreen", font=("Segoe UI", 22, "bold")).pack(anchor="w")
-        ttk.Label(
-            outer,
-            text="Experimental voice expression estimate · predictions are not psychological diagnoses",
-            foreground="#5b6573",
-        ).pack(anchor="w", pady=(2, 14))
+        header = ttk.Frame(outer)
+        header.pack(fill="x", pady=(0, 18))
+        self.brand_mark = tk.Canvas(header, width=48, height=48, highlightthickness=0, bd=0)
+        self.brand_mark.pack(side="left", padx=(0, 13))
+        self.brand_mark.create_oval(3, 3, 45, 45, fill="#667FA0", outline="")
+        self.brand_mark.create_text(24, 23, text="e", fill="#FFFFFF", font=("Georgia", 25, "bold"))
+        title_area = ttk.Frame(header)
+        title_area.pack(side="left", fill="x", expand=True)
+        self.widgets["title"] = ttk.Label(title_area, style="Title.TLabel")
+        self.widgets["title"].pack(anchor="w")
+        self.widgets["tagline"] = ttk.Label(title_area, style="Tagline.TLabel")
+        self.widgets["tagline"].pack(anchor="w", pady=(0, 1))
+        self.header_status_var = tk.StringVar()
+        ttk.Label(header, textvariable=self.header_status_var, style="Eyebrow.TLabel").pack(side="right", anchor="n", pady=7)
+
+        status = ttk.Frame(outer)
+        status.pack(fill="x", pady=(0, 12))
+        self.status_dot = tk.Canvas(status, width=18, height=18, highlightthickness=0, bd=0)
+        self.status_dot.pack(side="left", padx=(0, 8))
+        self.status_dot.create_oval(4, 4, 14, 14, fill="#A6AFBC", outline="", tags="dot")
+        self.status_var = tk.StringVar()
+        ttk.Label(status, textvariable=self.status_var).pack(side="left", fill="x", expand=True)
+        self.provider_status_var = tk.StringVar()
+        ttk.Label(status, textvariable=self.provider_status_var, foreground="#718096").pack(side="right")
 
         controls = ttk.Frame(outer)
-        controls.pack(fill="x", pady=(0, 12))
-        self.start_button = ttk.Button(controls, text="Start listening", command=self.start)
+        controls.pack(fill="x", pady=(0, 18))
+        self.start_button = ttk.Button(controls, command=self.start_listening, style="Primary.TButton")
         self.start_button.pack(side="left")
-        ttk.Button(controls, text="Pause / resume", command=self.pause_resume).pack(side="left", padx=6)
-        ttk.Button(controls, text="Stop", command=self.stop).pack(side="left")
-        ttk.Button(controls, text="Switch Mock / Live", command=self.switch_mode).pack(side="right")
+        self.pause_button = ttk.Button(controls, command=self.toggle_pause, style="Soft.TButton")
+        self.pause_button.pack(side="left", padx=(9, 0))
+        self.stop_button = ttk.Button(controls, command=self.stop_listening, style="Soft.TButton")
+        self.stop_button.pack(side="left")
+        self.dnd_var = tk.BooleanVar(value=False)
+        self.dnd_button = ttk.Checkbutton(controls, variable=self.dnd_var, command=self.toggle_dnd, style="Soft.TButton")
+        self.dnd_button.pack(side="right")
 
-        status_frame = ttk.LabelFrame(outer, text="Runtime status", padding=10)
-        status_frame.pack(fill="x")
-        self.mode_var = tk.StringVar()
-        self.audio_var = tk.StringVar(value="Stopped")
-        self.api_var = tk.StringVar(value="Not connected (Mock mode)")
-        ttk.Label(status_frame, textvariable=self.mode_var, width=32).grid(row=0, column=0, sticky="w", padx=4, pady=3)
-        ttk.Label(status_frame, textvariable=self.audio_var).grid(row=0, column=1, sticky="w", padx=4, pady=3)
-        ttk.Label(status_frame, textvariable=self.api_var).grid(row=1, column=0, columnspan=2, sticky="w", padx=4, pady=3)
+        preview = ttk.Frame(outer, style="Stage.TFrame")
+        preview.pack(fill="x", expand=False)
+        stage_height = min(270, max(205, self.root.winfo_screenheight() - 570))
+        self.preview_canvas = tk.Canvas(preview, height=stage_height, highlightthickness=0, bd=0)
+        self.preview_canvas.pack(fill="x", expand=False)
+        self.preview_canvas.bind("<Configure>", self._draw_preview)
+        self.preview_button = ttk.Button(preview, command=self.preview_response, style="Soft.TButton")
+        self.preview_button.pack(anchor="e", pady=(10, 0))
 
-        visual_frame = ttk.LabelFrame(outer, text="Live visual response", padding=10)
-        visual_frame.pack(fill="both", expand=True, pady=12)
-        self.canvas = tk.Canvas(visual_frame, height=210, background="#19212d", highlightthickness=0)
-        self.canvas.pack(fill="both", expand=True)
-        self.glow_circle = self.canvas.create_oval(0, 0, 0, 0, fill="#62b6a7", outline="")
-        self.emotion_text = self.canvas.create_text(0, 0, text="uncertain", fill="white", font=("Segoe UI", 20, "bold"))
-        self.energy_bar = self.canvas.create_rectangle(0, 0, 0, 0, fill="#62b6a7", outline="")
-        self.canvas.bind("<Configure>", self._layout_canvas)
+        settings = ttk.Frame(outer)
+        settings.pack(fill="x", pady=(16, 0))
+        self.lang_label = ttk.Label(settings)
+        self.lang_label.grid(row=0, column=0, sticky="w")
+        self.language_var = tk.StringVar(value=self._language)
+        self.language_box = ttk.Combobox(settings, textvariable=self.language_var, values=("zh-CN", "en"), state="readonly", width=10)
+        self.language_box.grid(row=0, column=1, padx=(8, 20), sticky="w")
+        self.language_box.bind("<<ComboboxSelected>>", self._change_language)
+        self.theme_label = ttk.Label(settings)
+        self.theme_label.grid(row=0, column=2, sticky="w")
+        self.theme_var = tk.StringVar(value=self._theme)
+        self.theme_box = ttk.Combobox(settings, textvariable=self.theme_var, values=("light", "dark"), state="readonly", width=9)
+        self.theme_box.grid(row=0, column=3, padx=8, sticky="w")
+        self.theme_box.bind("<<ComboboxSelected>>", self._change_theme)
+        self.static_var = tk.BooleanVar(value=self._static)
+        self.static_button = ttk.Checkbutton(settings, variable=self.static_var, command=self.toggle_static)
+        self.static_button.grid(row=1, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        self.motion_label = ttk.Label(settings)
+        self.motion_label.grid(row=1, column=2, sticky="w", pady=(10, 0))
+        self.motion_scale = ttk.Scale(settings, from_=0.0, to=1.0, command=self._change_strength)
+        self.motion_scale.set(self._motion_strength)
+        self.motion_scale.grid(row=1, column=3, sticky="ew", pady=(10, 0))
+        settings.columnconfigure(3, weight=1)
 
-        details = ttk.LabelFrame(outer, text="Features and decision", padding=10)
-        details.pack(fill="x")
-        self.features_var = tk.StringVar(value="Waiting for audio")
-        self.decision_var = tk.StringVar(value="No decision yet")
-        self.error_var = tk.StringVar(value="")
-        ttk.Label(details, textvariable=self.features_var).pack(anchor="w")
-        ttk.Label(details, textvariable=self.decision_var, wraplength=760).pack(anchor="w", pady=(5, 0))
-        ttk.Label(details, textvariable=self.error_var, foreground="#b42318", wraplength=760).pack(anchor="w", pady=(5, 0))
+        self.developer_var = tk.BooleanVar(value=False)
+        self.developer_toggle = ttk.Checkbutton(outer, variable=self.developer_var, command=self.toggle_developer)
+        self.developer_toggle.pack(anchor="w", pady=(12, 0))
+        self.developer_panel = ttk.LabelFrame(outer, padding=12)
+        self.scenario_var = tk.StringVar(value="user_achievement")
+        self.scenario_box = ttk.Combobox(self.developer_panel, textvariable=self.scenario_var, values=_SCENARIOS, state="readonly", width=25)
+        self.scenario_box.grid(row=0, column=1, sticky="ew", padx=8)
+        self.scenario_label = ttk.Label(self.developer_panel)
+        self.scenario_label.grid(row=0, column=0, sticky="w")
+        self.simulate_button = ttk.Button(self.developer_panel, command=self.simulate_scenario)
+        self.simulate_button.grid(row=0, column=2, padx=4)
+        self.text_label = ttk.Label(self.developer_panel)
+        self.text_label.grid(row=1, column=0, sticky="w", pady=(10, 0))
+        self.transcript_var = tk.StringVar()
+        self.transcript_entry = ttk.Entry(self.developer_panel, textvariable=self.transcript_var)
+        self.transcript_entry.grid(row=1, column=1, sticky="ew", padx=8, pady=(10, 0))
+        self.submit_button = ttk.Button(self.developer_panel, command=self.submit_text)
+        self.submit_button.grid(row=1, column=2, padx=4, pady=(10, 0))
+        self.provider_label = ttk.Label(self.developer_panel)
+        self.provider_label.grid(row=2, column=0, sticky="w", pady=(10, 0))
+        self.provider_var = tk.StringVar(value=self._provider_name)
+        self.provider_box = ttk.Combobox(self.developer_panel, textvariable=self.provider_var, values=("mock", "clef"), state="readonly", width=12)
+        self.provider_box.grid(row=2, column=1, sticky="w", padx=8, pady=(10, 0))
+        self.provider_box.bind("<<ComboboxSelected>>", self._change_provider)
+        self.decision_label = ttk.Label(self.developer_panel)
+        self.decision_label.grid(row=3, column=0, sticky="nw", pady=(10, 0))
+        self.decision_var = tk.StringVar(value="—")
+        ttk.Label(self.developer_panel, textvariable=self.decision_var, wraplength=540).grid(row=3, column=1, columnspan=2, sticky="w", padx=8, pady=(10, 0))
+        self.api_var = tk.StringVar(value="")
+        ttk.Label(self.developer_panel, textvariable=self.api_var, foreground="#A14B42", wraplength=580).grid(row=4, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        self.material_var = tk.StringVar(value="")
+        ttk.Label(self.developer_panel, textvariable=self.material_var, wraplength=580).grid(row=5, column=0, columnspan=3, sticky="w", pady=(4, 0))
+        self.developer_panel.columnconfigure(1, weight=1)
 
-        manual = ttk.Frame(outer)
-        manual.pack(fill="x", pady=(10, 0))
-        ttk.Label(manual, text="Mock emotion:").pack(side="left")
-        self.manual_emotion = tk.StringVar(value="calm")
-        ttk.Combobox(manual, textvariable=self.manual_emotion, values=[e for e in EMOTIONS if e != "uncertain"], width=14, state="readonly").pack(side="left", padx=6)
-        ttk.Button(manual, text="Apply simulated result", command=self.apply_manual_emotion).pack(side="left")
-        self._refresh_mode_labels()
+    def _selected_scenario(self) -> str:
+        selected = self.scenario_box.get()
+        for scenario in _SCENARIOS:
+            if selected in {scenario, text(scenario, self._language)}:
+                return scenario
+        return "user_achievement"
 
-    def _refresh_mode_labels(self) -> None:
-        source = "Mock (simulated; no microphone/API)" if self.config.mode == "mock" else "Live (microphone enabled by user)"
-        self.mode_var.set(f"Mode: {source}")
-        self.api_var.set("Clef provider configured; connection checked on first decision" if self.config.mode == "live" else "Clef API: not used")
-
-    def _layout_canvas(self, event) -> None:
-        center_x, center_y = event.width // 2, event.height // 2 - 10
-        self.canvas.coords(self.emotion_text, center_x, center_y)
-        self.canvas.coords(self.energy_bar, 18, event.height - 22, 18, event.height - 12)
-
-    def _schedule(self) -> None:
+    def _schedule_tick(self) -> None:
         if not self._closed:
-            self._after_id = self.root.after(round(1000 / self.config.visual.fps), self._tick)
+            self._after_id = self.root.after(33, self._tick)
 
     def _tick(self) -> None:
         if self._closed:
             return
-        if self._running:
+        if self._listening and not self._paused and self._audio is not None and self._audio_buffer is not None:
             try:
-                frame = self.audio.read_frame(timeout=0.002) if self.config.mode == "live" else self.audio.read_frame()
-                self.buffer.append(frame)
-                # Fast path: direct frame energy drives the bar without waiting for Clef.
-                frame_rms = float(np.sqrt(np.mean(np.asarray(frame, dtype=float) ** 2)))
-                self._draw_energy(frame_rms)
-                now = time.monotonic()
-                if now - self._last_feature_at >= 0.25 and len(self.buffer.snapshot()) >= int(self.config.audio.sample_rate * 0.25):
-                    self._features = self.extractor.extract(self.buffer.snapshot(), self.config.audio.sample_rate)
-                    self._last_feature_at = now
-                    self.features_var.set(
-                        f"RMS {self._features.rms:.3f} · F0 {self._format_optional(self._features.f0_hz)} · "
-                        f"voiced {self._features.voiced_ratio:.0%} · pause {self._features.pause_ratio:.0%} · "
-                        f"centroid {self._features.spectral_centroid_hz:.0f} Hz · quality {self._features.quality}"
-                    )
-                    if now - self._last_decision_at >= self.config.decision.interval_ms / 1000:
-                        self.decider.submit(self._features)
-                        self._last_decision_at = now
+                self._audio_buffer.append(self._audio.read_frame(timeout=0.002))
+                self._maybe_submit_audio()
             except TimeoutError:
                 pass
             except Exception as exc:
-                self._running = False
-                self.error_var.set(f"Audio input: {exc}")
-                self.audio_var.set("Audio input stopped")
-                try:
-                    self.audio.stop()
-                except Exception:
-                    pass
-            for result in self.decider.poll():
-                smoothed = self.smoother.update(result)
-                self._visual_state = self.controller.create(smoothed, self._features)
-                self.canvas.itemconfigure(self.emotion_text, text=smoothed.emotion)
-                self.decision_var.set(self._format_decision(smoothed))
-                self.error_var.set("")
-            if self.decider.last_error:
-                self.error_var.set(self.decider.last_error)
-            self._draw_visual()
-        self._schedule()
+                self.api_var.set(str(exc))
+                self.stop_listening()
+        if self._audio_worker is not None:
+            for result in self._audio_worker.poll():
+                analysis = result.analysis
+                transition = self._audio_states.update(
+                    analysis,
+                    required_confirmations=1 if self._audio_file_preview else None,
+                )
+                self.decision_var.set(
+                    f"稳定状态 {self._audio_states.state} · 当前窗 {analysis.state} · "
+                    f"quality {analysis.quality} · 规则分 {analysis.score:.0%} · {analysis.note}"
+                )
+                self.provider_status_var.set(f"{self._audio_states.state} · {analysis.score:.0%}")
+                if transition is not None:
+                    event = self._audio_policy.evaluate(
+                        transition,
+                        language=self._language,
+                        listening=self._listening or self._audio_file_preview,
+                        dnd=self._dnd,
+                        paused=self._paused,
+                        popup_active=self.comfort.visible,
+                    )
+                    if event is not None:
+                        self._preview_action = event.action
+                        self._draw_preview()
+                        self.comfort.show(event)
+                    elif transition.previous_state == "low_arousal" and self.comfort.visible:
+                        self.comfort.hide()
+                self._audio_file_preview = False
+            if self._audio_worker.last_error:
+                self.provider_status_var.set("分析失败")
+                self.api_var.set(f"声学分析失败：{self._audio_worker.last_error}")
+                self._audio_file_preview = False
+        for event in self.runtime.poll(
+            language=self._language,
+            dnd=self._dnd,
+            paused=self._paused,
+            popup_active=self.comfort.visible,
+            listening=self._listening,
+        ):
+            self._preview_action = event.action
+            self._draw_preview()
+            self.comfort.show(event)
+        decision = self.runtime.last_decision
+        if self._developer_mode and decision is not None:
+            confidence = decision.confidence.get("response") if decision.confidence else None
+            confidence_text = "—" if confidence is None else f"{confidence:.0%}"
+            self.decision_var.set(
+                f"{decision.source} · {decision.relevance} · {decision.event_status} · {decision.attitude} · {decision.event_relation} · "
+                f"{decision.response}/{decision.intensity}/{decision.timing} · confidence {confidence_text} · {decision.latency_ms:.0f} ms"
+            )
+        if self.runtime.last_error:
+            error = self.runtime.last_error
+            status = f"{text('api_offline', self._language)} {error}"
+            if self._provider_name == "clef":
+                self.provider_var.set("mock")
+                self._change_provider()
+            self.api_var.set(status)
+        self._schedule_tick()
 
-    @staticmethod
-    def _format_optional(value: float | None) -> str:
-        return "unavailable" if value is None else f"{value:.1f} Hz"
-
-    @staticmethod
-    def _format_decision(result: DecisionResult) -> str:
-        top = sorted(result.probabilities.items(), key=lambda item: item[1], reverse=True)[:4]
-        probability_text = ", ".join(f"{name} {value:.0%}" for name, value in top)
-        confidence = "unknown" if result.confidence is None else f"{result.confidence:.0%}"
-        return f"{result.source.upper()} · {probability_text} · confidence {confidence} · {result.latency_ms:.1f} ms"
-
-    def _draw_energy(self, value: float) -> None:
-        width = self.canvas.winfo_width()
-        height = self.canvas.winfo_height()
-        end = 18 + max(0.0, min(1.0, value * 3)) * max(0, width - 36)
-        self.canvas.coords(self.energy_bar, 18, height - 22, end, height - 12)
-        self.canvas.itemconfigure(self.energy_bar, fill=self._visual_state.theme_color)
-
-    def _draw_visual(self) -> None:
-        if self.config.visual.animation_enabled:
-            phase = (time.monotonic() * self._visual_state.animation_speed) % (2 * np.pi)
-            width, height = self.canvas.winfo_width(), self.canvas.winfo_height()
-            radius = 48 + 14 * self._visual_state.motion_amplitude * (0.5 + 0.5 * np.sin(phase))
-            center_x, center_y = width // 2, height // 2 - 10
-            self.canvas.coords(self.glow_circle, center_x - radius, center_y - radius, center_x + radius, center_y + radius)
-            self.canvas.itemconfigure(self.glow_circle, fill=self._visual_state.theme_color)
-
-    def start(self) -> None:
-        try:
-            self.audio.start()
-            self._running = True
-            self.audio_var.set("Listening — click Pause / Stop at any time" if self.config.mode == "live" else "Mock audio running")
-            self.error_var.set("")
-        except Exception as exc:
-            self._running = False
-            self.audio_var.set("Start failed")
-            self.error_var.set(str(exc))
-
-    def pause_resume(self) -> None:
-        if self._running:
-            self.stop()
-            self.audio_var.set("Paused")
-        else:
-            self.start()
-
-    def stop(self) -> None:
-        self._running = False
-        try:
-            self.audio.stop()
-            self.audio_var.set("Stopped")
-        except Exception as exc:
-            self.audio_var.set("Audio cleanup error")
-            self.error_var.set(str(exc))
-
-    def switch_mode(self) -> None:
-        self.stop()
-        self._configure_mode("live" if self.config.mode == "mock" else "mock")
-        self._refresh_mode_labels()
-        self.audio_var.set("Stopped")
-
-    def apply_manual_emotion(self) -> None:
-        if self.config.mode != "mock":
-            messagebox.showinfo("Mock control", "Switch to Mock mode to apply a simulated emotion.", parent=self.root)
+    def _maybe_submit_audio(self) -> None:
+        if self._audio_worker is None or self._audio_buffer is None:
             return
-        selected = self.manual_emotion.get()
-        result = DecisionResult(selected, {selected: 1.0}, 1.0, "mock", note="Manually selected simulation")
-        self._visual_state = self.controller.create(result, self._features)
-        self.canvas.itemconfigure(self.emotion_text, text=result.emotion)
-        self.decision_var.set(self._format_decision(result))
+        now = time.monotonic()
+        interval = self.config.audio.window_seconds
+        if now - self._last_audio_submit < interval:
+            return
+        samples = self._audio_buffer.snapshot()
+        if len(samples) < self.config.audio.sample_rate * interval:
+            return
+        self._last_audio_submit = now
+        self._audio_worker.submit(samples, self.config.audio.sample_rate)
+
+    def analyze_audio_file(self, path: str | Path) -> None:
+        try:
+            samples, sample_rate = load_pcm_wav(path)
+            if self._audio_worker is not None:
+                self._audio_worker.close()
+            self._audio_worker = AudioAnalysisWorker()
+            self._audio_file_preview = True
+            self._audio_states.reset()
+            self.provider_status_var.set("WAV · 分析中")
+            self._audio_worker.submit(samples, sample_rate)
+        except Exception as exc:
+            self._audio_file_preview = False
+            self.provider_status_var.set("WAV · 失败")
+            self.api_var.set(f"WAV 分析失败：{exc}")
+
+    def start_listening(self) -> None:
+        if self._listening:
+            return
+        if self.config.mode == "live":
+            try:
+                if self._audio_worker is not None:
+                    self._audio_worker.close()
+                self._audio = SoundDeviceAudioInput(
+                    self.config.audio.sample_rate, self.config.audio.frame_ms,
+                    self.config.audio.device, self.config.audio.channels,
+                )
+                self._audio_buffer = AudioRingBuffer(round(self.config.audio.sample_rate * self.config.audio.window_seconds))
+                self._audio_worker = AudioAnalysisWorker()
+                self._audio.start()
+                self._audio_states.reset()
+            except Exception as exc:
+                self.api_var.set(f"麦克风/声学分析启动失败：{exc}")
+                if self._audio_worker is not None:
+                    self._audio_worker.close()
+                    self._audio_worker = None
+                if self._audio is not None:
+                    try:
+                        self._audio.stop()
+                    except Exception:
+                        pass
+                return
+        self._listening = True
+        self._paused = False
+        self._refresh_status()
+
+    def toggle_pause(self) -> None:
+        if not self._listening:
+            return
+        self._paused = not self._paused
+        if self._paused and self._audio is not None:
+            self._audio.stop()
+            self._audio_states.reset()
+            self.comfort.dismiss()
+        elif not self._paused and self._audio is not None:
+            try:
+                self._audio.start()
+            except Exception as exc:
+                self.api_var.set(f"麦克风恢复失败：{exc}")
+                self.stop_listening()
+                return
+        self._refresh_text()
+
+    def stop_listening(self) -> None:
+        self._listening = False
+        self._paused = False
+        if self.config.mode == "live":
+            self._audio_states.reset()
+            self.comfort.dismiss()
+        if self._audio is not None:
+            try:
+                self._audio.stop()
+            except Exception as exc:
+                self.api_var.set(f"麦克风停止失败：{exc}")
+        self._refresh_text()
+
+    def toggle_dnd(self) -> None:
+        self._dnd = self.dnd_var.get()
+        if self._dnd:
+            self.comfort.dismiss()
+        self._refresh_status()
+
+    def toggle_static(self) -> None:
+        self._static = self.static_var.get()
+        self.comfort.set_reduced_motion(self._static)
+
+    def toggle_developer(self) -> None:
+        self._developer_mode = self.developer_var.get()
+        if self._developer_mode:
+            self.developer_panel.pack(fill="x", pady=(6, 0))
+        else:
+            self.developer_panel.pack_forget()
+
+    def _change_language(self, _event=None) -> None:
+        self._language = self.language_var.get()
+        self.comfort.set_language(self._language)
+        self._refresh_text()
+
+    def _change_theme(self, _event=None) -> None:
+        self._theme = self.theme_var.get()
+        self._apply_theme()
+
+    def _change_strength(self, value: str) -> None:
+        self._motion_strength = float(value)
+        if hasattr(self, "comfort"):
+            self.comfort.set_motion_strength(self._motion_strength)
+
+    def _change_provider(self, _event=None) -> None:
+        selected = self.provider_var.get()
+        if selected == self._provider_name:
+            return
+        self._provider_name = selected
+        self.runtime.switch_provider(
+            ClefDecisionProvider(self.config.decision.clef_base_url, timeout_seconds=self.config.decision.timeout_seconds)
+            if selected == "clef"
+            else MockDecisionProvider()
+        )
+        self.provider_status_var.set(text("mock_mode" if selected == "mock" else "clef_mode", self._language))
+        self.api_var.set("")
+
+    def simulate_scenario(self) -> None:
+        scenario_id = self._selected_scenario()
+        segment = self._transcripts.scenario(scenario_id, self._language if self._provider_name == "mock" else self.config.transcript.language)
+        self.transcript_var.set(segment.text)
+        self._submit_segment(segment, scenario_id)
+
+    def submit_text(self) -> None:
+        value = self.transcript_var.get().strip()
+        if not value:
+            return
+        source = "manual" if self._provider_name == "clef" else "mock"
+        segment = TranscriptSegment(value, language=self._language, source=source)
+        self._submit_segment(segment, None)
+
+    def _submit_segment(self, segment: TranscriptSegment, scenario_id: str | None) -> None:
+        request = self.runtime.ingest(segment, scenario_id)
+        if request is not None:
+            self.decision_var.set(f"context #{request.context_revision} · {self._provider_name} · {segment.text}")
+
+    def preview_response(self) -> None:
+        action = self._preview_action
+        event = ResponseEvent(action, text(action, self._language), "gentle", "preview", 3.0, self._language)
+        self.comfort.show(event)
+
+    def _refresh_text(self) -> None:
+        if not hasattr(self, "widgets"):
+            return
+        t = lambda key: text(key, self._language)
+        self.root.title(t("app_title"))
+        self.widgets["title"].configure(text="EmotiScreen")
+        self.widgets["tagline"].configure(text=t("tagline"))
+        self.start_button.configure(text=t("start"))
+        self.pause_button.configure(text=t("resume" if self._paused else "pause"))
+        self.stop_button.configure(text=t("stop"))
+        self.dnd_button.configure(text=t("dnd"))
+        self.preview_button.configure(text=t("preview"))
+        self.lang_label.configure(text=t("language"))
+        self.theme_label.configure(text=t("theme"))
+        self.static_button.configure(text=t("static"))
+        self.motion_label.configure(text=t("strength"))
+        self.developer_toggle.configure(text=t("developer"))
+        self.scenario_label.configure(text=t("decision"))
+        self.simulate_button.configure(text=t("simulate"))
+        self.text_label.configure(text=t("user_input"))
+        self.submit_button.configure(text=t("simulate"))
+        self.provider_label.configure(text=t("api_status"))
+        self.decision_label.configure(text=t("decision"))
+        self._refresh_material_label()
+        self._refresh_scenario_names()
+        self._refresh_status()
+        self._draw_preview()
+
+    def _refresh_scenario_names(self) -> None:
+        self.scenario_box.configure(values=[text(scenario, self._language) for scenario in _SCENARIOS])
+        scenario_id = self.scenario_var.get()
+        if scenario_id not in _SCENARIOS:
+            scenario_id = _SCENARIOS[0]
+            self.scenario_var.set(scenario_id)
+        self.scenario_box.set(text(scenario_id, self._language))
+
+    def _refresh_status(self) -> None:
+        if self._dnd:
+            status = text("status_dnd", self._language)
+        elif self._paused:
+            status = text("status_paused", self._language)
+        elif not self._listening:
+            status = text("status_stopped", self._language)
+        elif self.config.mode == "live":
+            status = text("status_live", self._language)
+        else:
+            status = text("status_mock", self._language)
+        self.status_var.set(status)
+        if hasattr(self, "header_status_var"):
+            mode_label = "LIVE AUDIO" if self.config.mode == "live" else "MOCK" if self._provider_name == "mock" else "CLEF"
+            self.header_status_var.set("• " + mode_label)
+        color = "#C7A96B" if self._dnd else "#76A891" if self._listening and not self._paused else "#A6AFBC"
+        self.status_dot.itemconfigure("dot", fill=color)
+        if hasattr(self, "provider_status_var"):
+            provider_key = "acoustic_mode" if self.config.mode == "live" else "mock_mode" if self._provider_name == "mock" else "clef_mode"
+            self.provider_status_var.set(text(provider_key, self._language))
+
+    def _draw_preview(self, _event=None) -> None:
+        if not hasattr(self, "preview_canvas"):
+            return
+        self.preview_canvas.delete("all")
+        width = max(300, min(self.preview_canvas.winfo_width(), max(360, self.root.winfo_width() - 60)))
+        height = max(250, self.preview_canvas.winfo_height())
+        dark = self._theme == "dark"
+        bg = "#202A38" if dark else "#EEF2F7"
+        ink = "#EEF2F8" if dark else "#34455B"
+        muted = "#A7B3C3" if dark else "#718199"
+        card = "#293545" if dark else "#FCFDFE"
+        border = "#3A485A" if dark else "#FFFFFF"
+        action_color = {
+            "support": "#8FA4C3" if dark else "#718AAE",
+            "celebrate": "#E0B563" if dark else "#C7913F",
+            "acknowledge": "#8FB6A3" if dark else "#648E7B",
+        }.get(self._preview_action, "#8FA4C3")
+        self.preview_canvas.configure(bg=bg)
+        self.preview_canvas.create_text(26, 20, anchor="w", text=text("preview_caption", self._language).upper(), fill=muted, font=("Segoe UI", 8, "bold"))
+        self.preview_canvas.create_oval(width - 185, 12, width - 55, 142, fill="#607797" if dark else "#D4DFEC", outline="", stipple="gray50")
+        self.preview_canvas.create_oval(24, height - 118, 118, height - 24, fill="#8196B3" if dark else "#DCE5EF", outline="", stipple="gray50")
+        card_width = min(490, width - 60)
+        card_height = 154
+        x1 = (width - card_width) / 2
+        y1 = (height - card_height) / 2 + 10
+        for offset, color in ((7, "#C9D3E0" if not dark else "#141B24"), (4, "#D5DDE7" if not dark else "#19212C")):
+            _rounded_rectangle(self.preview_canvas, x1 + offset, y1 + offset, x1 + card_width + offset, y1 + card_height + offset, 24, color)
+        _rounded_rectangle(self.preview_canvas, x1, y1, x1 + card_width, y1 + card_height, 24, card, border)
+        self.preview_canvas.create_oval(x1 + 25, y1 + 28, x1 + 67, y1 + 70, fill=action_color, outline="")
+        icon = "♥" if self._preview_action == "support" else "✦" if self._preview_action == "celebrate" else "•"
+        self.preview_canvas.create_text(x1 + 46, y1 + 48, text=icon, fill="#FFFFFF", font=("Segoe UI Symbol", 17, "bold"))
+        self.preview_canvas.create_text(x1 + 84, y1 + 36, anchor="w", text=text(f"tag_{self._preview_action}", self._language).upper(), fill=muted, font=("Segoe UI", 8, "bold"))
+        self.preview_canvas.create_text(x1 + 84, y1 + 78, anchor="w", text=text(self._preview_action, self._language), fill=ink, font=("Microsoft YaHei UI", 24, "bold"))
+        self.preview_canvas.create_line(x1 + 26, y1 + 112, x1 + card_width - 26, y1 + 112, fill=border, width=1)
+        self.preview_canvas.create_text(x1 + 26, y1 + 132, anchor="w", text=text("privacy_hint", self._language), fill=muted, font=("Microsoft YaHei UI", 9))
+
+    def _apply_theme(self) -> None:
+        dark = self._theme == "dark"
+        background = "#1B222D" if dark else "#F5F7FA"
+        foreground = "#E9EDF3" if dark else "#263445"
+        self.root.configure(bg=background)
+        self.style.configure("TFrame", background=background)
+        self.style.configure("TLabelframe", background=background, foreground=foreground)
+        self.style.configure("TLabelframe.Label", background=background, foreground=foreground)
+        self.style.configure("TLabel", background=background, foreground=foreground)
+        self.style.configure("Title.TLabel", background=background, foreground=foreground)
+        self.style.configure("Tagline.TLabel", background=background, foreground="#A0AABA" if dark else "#687486")
+        self.style.configure("Stage.TFrame", background="#202A38" if dark else "#EEF2F7", borderwidth=0)
+        primary_bg = "#91A8C7" if dark else "#4C6A8E"
+        primary_fg = "#15202D" if dark else "#FFFFFF"
+        soft_bg = "#2D3949" if dark else "#E5EAF1"
+        soft_fg = "#E8EDF4" if dark else "#40536B"
+        self.style.configure("Primary.TButton", background=primary_bg, foreground=primary_fg, padding=(18, 11), borderwidth=0)
+        self.style.map("Primary.TButton", background=[("active", "#6682A7" if dark else "#395B80")])
+        self.style.configure("Soft.TButton", background=soft_bg, foreground=soft_fg, padding=(14, 10), borderwidth=0)
+        self.style.map("Soft.TButton", background=[("active", "#3B4A5D" if dark else "#D8E0EA")])
+        if hasattr(self, "comfort"):
+            self.comfort.set_theme(self._theme)
+        self._refresh_material_label()
+        self._draw_preview()
+
+    def _refresh_material_label(self) -> None:
+        if hasattr(self, "material_var") and hasattr(self, "comfort"):
+            material_key = "native_acrylic" if self.comfort.native_blur else "fallback_glass"
+            self.material_var.set(text(material_key, self._language))
 
     def close(self) -> None:
         if self._closed:
             return
         self._closed = True
-        self._running = False
-        try:
-            self.audio.stop()
-        except Exception:
-            pass
-        finally:
+        self.stop_listening()
+        self.runtime.close()
+        if self._audio_worker is not None:
+            self._audio_worker.close()
+        self.comfort.close()
+        if self._after_id:
             try:
-                self.decider.close()
-            finally:
-                if self._after_id is not None:
-                    self.root.after_cancel(self._after_id)
-                self.root.destroy()
+                self.root.after_cancel(self._after_id)
+            except tk.TclError:
+                pass
+        self.root.destroy()
 
     def run(self) -> None:
         self.root.mainloop()

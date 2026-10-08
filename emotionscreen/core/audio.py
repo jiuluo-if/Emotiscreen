@@ -3,37 +3,36 @@
 from __future__ import annotations
 
 from collections import deque
-import math
 import queue
 import threading
+import wave
+from pathlib import Path
 
 import numpy as np
 
 
-class MockAudioInput:
-    def __init__(self, sample_rate: int = 16_000, frame_ms: int = 32, seed: int = 42) -> None:
-        self.sample_rate = sample_rate
-        self.frame_ms = frame_ms
-        self.frame_size = round(sample_rate * frame_ms / 1000)
-        self._rng = np.random.default_rng(seed)
-        self._sample_cursor = 0
-        self.is_running = False
+def load_pcm_wav(path: str | Path) -> tuple[np.ndarray, int]:
+    """Read local mono/stereo 16-bit PCM WAV into normalized mono memory samples."""
+    try:
+        with wave.open(str(path), "rb") as source:
+            if source.getcomptype() != "NONE" or source.getsampwidth() != 2:
+                raise ValueError("only uncompressed 16-bit PCM WAV files are supported")
+            channels = source.getnchannels()
+            if channels not in {1, 2}:
+                raise ValueError("WAV audio must be mono or stereo")
+            sample_rate = source.getframerate()
+            if sample_rate <= 0 or source.getnframes() > sample_rate * 10:
+                raise ValueError("WAV samples must contain between 0 and 10 seconds of audio")
+            raw = source.readframes(source.getnframes())
+    except (OSError, wave.Error) as exc:
+        raise ValueError(f"cannot read PCM WAV: {exc}") from exc
 
-    def start(self) -> None:
-        self.is_running = True
-
-    def read_frame(self) -> np.ndarray:
-        if not self.is_running:
-            raise RuntimeError("audio input must be started before reading")
-        positions = np.arange(self.frame_size) + self._sample_cursor
-        seconds = positions / self.sample_rate
-        envelope = 0.12 + 0.07 * (1 + math.sin(seconds[0] * 0.8))
-        tone = np.sin(2 * np.pi * (180 + 60 * math.sin(seconds[0] * 0.3)) * seconds)
-        self._sample_cursor += self.frame_size
-        return (envelope * tone + self._rng.normal(0, 0.005, self.frame_size)).astype(np.float32)
-
-    def stop(self) -> None:
-        self.is_running = False
+    samples = np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
+    if channels == 2:
+        samples = samples.reshape(-1, 2).mean(axis=1)
+    if samples.size == 0:
+        raise ValueError("WAV file contains no audio samples")
+    return samples, sample_rate
 
 
 class SoundDeviceAudioInput:

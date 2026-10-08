@@ -7,22 +7,29 @@
     "window_seconds": 2.0,
     "device": null
   },
+  "transcript": {
+    "provider": "mock",
+    "language": "zh-CN"
+  },
   "decision": {
     "provider": "mock",
     "clef_base_url": "http://127.0.0.1:8080",
-    "timeout_seconds": 5.0,
-    "interval_ms": 1000,
-    "seed": 42
+    "timeout_seconds": 5.0
   },
-  "visual": {
-    "fps": 30,
-    "animation_enabled": true,
-    "overlay_enabled": false
+  "context": {
+    "max_turns": 6
   },
-  "emotion": {
-    "smoothing_alpha": 0.35,
-    "min_hold_ms": 1500,
-    "confirm_count": 2,
-    "uncertain_fallback": "calm"
+  "response": {
+    "celebrate_cooldown_seconds": 45,
+    "support_cooldown_seconds": 30,
+    "acknowledge_cooldown_seconds": 20,
+    "dedupe_seconds": 600,
+    "duration_seconds": 3
+  },
+  "ui": {
+    "language": "zh-CN",
+    "theme": "system",
+    "reduced_motion": false,
+    "motion_strength": 0.35
   }
 }

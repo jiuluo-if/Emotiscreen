@@ -1,53 +1,52 @@
-"""Shared immutable data structures passed between application modules."""
+"""情境回应流水线使用的不可变值对象。"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 import time
 
-EMOTIONS = ("happy", "excited", "sad", "angry", "anxious", "fearful", "tired", "calm", "uncertain")
+
+@dataclass(frozen=True)
+class TranscriptSegment:
+    text: str
+    language: str = "zh-CN"
+    speaker: str = "user"
+    is_final: bool = True
+    source: str = "mock"
+    created_at: float = field(default_factory=time.monotonic, compare=False)
 
 
 @dataclass(frozen=True)
-class AcousticFeatures:
-    sample_rate: int = 16_000
-    rms: float = 0.0
-    peak: float = 0.0
-    energy_change: float = 0.0
-    f0_hz: float | None = None
-    f0_voiced_ratio: float = 0.0
-    pitch_range_hz: float | None = None
-    voiced_ratio: float = 0.0
-    pause_ratio: float = 1.0
-    rhythm_rate_hz: float = 0.0
-    spectral_centroid_hz: float = 0.0
-    spectral_flux: float = 0.0
-    zero_crossing_rate: float = 0.0
-    quality: str = "unknown"
-    quality_flags: tuple[str, ...] = ()
-    captured_at: float = field(default_factory=time.monotonic, compare=False)
+class DecisionRequest:
+    context: tuple[TranscriptSegment, ...]
+    context_revision: int
+    scenario_id: str | None = None
 
 
 @dataclass(frozen=True)
 class DecisionResult:
-    emotion: str
-    probabilities: dict[str, float]
-    confidence: float | None
-    source: str
-    arousal: str = "unknown"
-    screen_mode: str = "breathing"
+    relevance: str = "uncertain"
+    event_status: str = "uncertain"
+    attitude: str = "explicit"
+    event_relation: str = "uncertain"
+    response: str = "none"
+    intensity: str = "none"
+    timing: str = "suppress"
+    event_id: str | None = None
+    probabilities: dict[str, dict[str, float]] = field(default_factory=dict)
+    confidence: dict[str, float] = field(default_factory=dict)
+    source: str = "mock"
+    context_revision: int = 0
     latency_ms: float = 0.0
     created_at: float = field(default_factory=time.monotonic, compare=False)
     note: str = ""
 
 
 @dataclass(frozen=True)
-class VisualState:
-    emotion: str = "uncertain"
-    theme_color: str = "#75849a"
-    glow_intensity: float = 0.0
-    animation_speed: float = 1.0
-    particle_count: int = 0
-    motion_amplitude: float = 0.0
-    transition_seconds: float = 0.5
-    energy_level: float = 0.0
+class ResponseEvent:
+    action: str
+    phrase: str
+    intensity: str
+    event_id: str
+    duration_seconds: float
+    language: str

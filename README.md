@@ -1,67 +1,93 @@
-# EmotionScreen V1.0
+# EmotiScreen V0.3
 
-EmotionScreen 是一个可迁移的 Python 桌面程序骨架，用于实验语音驱动的颜色与动画反馈。默认模拟模式不需要麦克风、Clef 服务或 GPU，也不会保存音频。情绪结果只是实验性的表达估计，不是心理诊断。
+EmotiScreen 是一款本地桌面音频陪伴程序。用户明确开启监听后，程序在内存中分析短音频窗里的 RMS、能量变化、基频、过零率、频谱重心和有声比例；只有连续状态从高唤醒稳定切换到低唤醒时，屏幕右下角的安抚卡片才渐入显示，短暂停留后渐隐。启动时声音本来就低沉时只显示状态，不据此判定悲伤。
 
-## 运行演示
+**当前实时音频链路不使用 ASR，也不把原始音频发送给 Clef 或其他服务。** 这是传统声学特征启发式，只估计声音低唤醒/活跃/不确定状态；无法从这些特征可靠区分悲伤、疲劳、平静或兴奋等语义情绪。低质量、静音、基频无效和不确定状态不触发回应。该功能不做心理诊断。
 
-运行环境：Python 3.11 或更高版本、Tkinter、NumPy。
+## 安装与运行
+
+要求 Python 3.11+、Tkinter、NumPy。默认 `mock` 模式无需麦克风：
 
 ```powershell
 python -m pip install -r requirements.txt
 python main.py
 ```
 
-窗口默认以模拟模式启动。点击“Start listening”后，程序生成可复现的模拟音频；可使用模拟情绪选择器预览情绪效果。“Switch Mock / Live”用于切换输入源和决策服务。切换到 Live 不会自动打开麦克风，必须由用户再次点击启动。监听状态会显示在界面上，随时可以暂停或停止。
+主界面支持模拟对话、安抚窗口预览、主题、动效强度、减少动态效果、免打扰和中英文切换。
 
-无需打开窗口即可验证完整模拟链路：
+运行无麦克风的处理链路检查：
 
 ```powershell
 python main.py --check
 ```
 
-运行自动化测试：
+对本地测试 WAV 查看单段声学状态（不安装麦克风）：
+
+```powershell
+python main.py --audio-file path\to\sample.wav
+```
+
+目前只接受单/双声道、16-bit PCM、最长10秒的 WAV。孤立 WAV 只显示状态估计；安抚反馈需要实时窗口中稳定的高唤醒→低唤醒变化。
+
+开发测试：
 
 ```powershell
 python -m pip install -r requirements-dev.txt
-python -m pytest -q
+python -m pytest tests/test_pipeline.py tests/test_runtime.py tests/test_config_ui.py -q
 ```
 
-## 目标设备上的 Live 配置
+## 本地麦克风分析
 
-在目标设备编辑 `config.json`，例如：
+安装麦克风依赖：
+
+```powershell
+python -m pip install sounddevice
+```
+
+把配置中的 `mode` 设为 `live`，`decision.provider` 设为 `acoustic`，然后启动程序并点击“开始监听”。麦克风只在点击后打开；“暂停”“停止”“免打扰”和关闭窗口会抑制或停止后续处理。
 
 ```json
 {
   "mode": "live",
-  "audio": { "sample_rate": 16000, "channels": 1, "frame_ms": 32, "window_seconds": 2.0, "device": null },
-  "decision": { "provider": "clef", "clef_base_url": "http://127.0.0.1:8080", "timeout_seconds": 5, "interval_ms": 1000, "seed": 42 }
+  "audio": {
+    "sample_rate": 16000,
+    "channels": 1,
+    "frame_ms": 32,
+    "window_seconds": 2.0,
+    "device": null
+  },
+  "decision": {
+    "provider": "acoustic",
+    "clef_base_url": "http://127.0.0.1:8080",
+    "timeout_seconds": 5.0
+  }
 }
 ```
 
-在目标设备安装可选麦克风依赖：`python -m pip install sounddevice`。只有用户点击启动后才开始采音。音频只保留在有界内存缓冲区内，本程序不会将音频写入磁盘或上传。请在目标系统确认麦克风权限和设备选择。
+音频回调只写入有界内存队列；特征计算在单个后台线程运行，繁忙时只保留最新窗口。程序不录音、不写文件、不保留长期特征。`sounddevice` 不可用或设备启动失败时，界面显示错误并保持静默。
 
-## Clef 接入边界
+## Clef 的用途
 
-当前适配器会向 `{clef_base_url}/v1/systemone` 发送 JSON 请求，预期响应包含 `choices.emotion.selected`、`choices.emotion.probabilities`、可选的 `choices.emotion.confidence`、`choices.arousal.selected` 和 `choices.screen_mode.selected`。适配器会检查类别、概率取值与总和、confidence 范围，并将 confidence 与候选概率分开保存。
+本地 Clef GGUF 与 llama.cpp 可继续用于开发面板中的手工文本情境测试，但当前不接收实时声音，也不参与实时音频情绪分析。Clef 服务必须绑定本机 loopback；远端 URL 会被配置校验拒绝。
 
-**此请求与响应结构尚未在目标 Clef 服务上验证。** 将 Live 模式视为正式接入前，请先核实目标设备上的 System One 契约，并用实际响应样例更新 `emotionscreen/core/decision.py` 和测试。未知或格式错误的响应会显示为错误；程序不会伪造概率，也不会自动重试或重放请求。
+## 开源测试音频与限制
 
-## 模块说明
+可从 [RAVDESS 官方语音数据集](https://zenodo.org/records/1188976) 取得测试音频；作者提供的 [16 kHz 语音压缩包](https://zenodo.org/records/11063852) 更便于本地试跑。其语音由演员表演录制，标签包含中性、平静、开心、悲伤、愤怒、恐惧、厌恶和惊讶。数据使用 CC BY-NC-SA 4.0，需按原始 Zenodo 记录署名；商业使用需另行取得许可。RAVDESS 的表演式英语语音结果不能外推到日常对话或中文语音。
 
-- `emotionscreen/config.py`：JSON 默认值和参数范围校验。
-- `emotionscreen/core/audio.py`：模拟输入、可选 sounddevice 输入、有界环形缓冲区。
-- `emotionscreen/core/features.py`：RMS、峰值、能量变化、自相关基频、有声/停顿比例、节奏代理、频谱重心/通量、过零率和质量标记。
-- `emotionscreen/core/decision.py`：固定随机种子的模拟提供器和严格校验的 Clef 适配器。
-- `emotionscreen/core/smoothing.py`：连续确认、最短保持时间、过期结果和不确定结果处理。
-- `emotionscreen/core/controller.py`：将情绪和即时声音能量映射为视觉参数。
-- `emotionscreen/core/runtime.py`：单后台工作线程、单个执行中请求和可替换的最新待处理特征。
-- `emotionscreen/ui/window.py`：Tkinter 界面与动画。
+声学状态是可观察信号的粗略代理，不是“正确读心”。界面中的规则分是阈值分数，不是概率。当前规则未在足够多说话人、环境和真实自发表达上校准，因此不报告普适准确率；实际情绪分类准确率标记为未知。`--check` 使用合成信号证明数组处理、策略和回应对象可连通，不代表真实情绪识别准确。
 
-## 当前限制与后续联调
+本机另对 RAVDESS Actor 01 的 24 段 16 kHz 语音做了探索性检查：中性 4/4、平静 7/8、悲伤 4/4 被归入低唤醒；开心 4/8 为高唤醒、2/8 低唤醒、2/8 不确定。按样本顺序连续送入状态跟踪器时，高唤醒转低唤醒产生了 1 次 support。**这些数值不是情绪准确率**：中性/平静/悲伤在纯声学特征上重叠明显，当前只能检测唤醒度变化，不能确认语义情绪。支持弹窗只在持续状态从高唤醒切换到低唤醒时出现；孤立 WAV 试听显示估计结果，不单独触发安抚。评估只用一名演员和四类样本，需更多说话人和真实自发表达才能判断分类效果。
 
-- 尚未使用带标签的数据集评估分类准确率；模拟结果和单元测试通过均不能证明真实情绪识别有效。
-- 真实麦克风输入和设备选择需要在目标操作系统及音频硬件上验证。
-- 将真实 Clef System One 响应格式加入适配器和测试后，才能确认 Live 决策已接通。
-- 当前声学特征是轻量信号处理代理，不是完整的 GeMAPS/eGeMAPS 实现；阈值需用目标音频校准。
-- 透明桌面覆盖层未实现，配置中保持关闭。
-- 性能数据须在目标设备上实际测量，包括采音丢帧、特征耗时、决策 P50/P95 和界面帧率；当前没有性能保证。
+## 项目结构
+
+本地声学计算和窗口交互只挑选 pyAudioAnalysis、TkAnimator、CTkMessagebox 等开源代码中的小段实现并按本项目约束修改；没有克隆完整仓库、GUI 或权重。出处、许可证和适配范围见 [`docs/opensource-guidance.md`](docs/opensource-guidance.md)。
+
+- `emotionscreen/core/audio.py`：麦克风输入和有界音频缓冲。
+- `emotionscreen/core/acoustic.py`：纯 Python/NumPy 声学特征与粗略状态估计。
+- `emotionscreen/core/audio_runtime.py`：后台音频分析和最新窗口替换。
+- `emotionscreen/core/audio_policy.py`：规则分、重复、冷却、DND、暂停和窗口冲突门控。
+- `emotionscreen/core/decision.py`、`runtime.py`：开发面板手工文本的 Mock/Clef 情境链路，不用于音频。
+- `emotionscreen/ui/comfort_window.py`、`glass.py`：可拖动安抚卡片、渐入渐隐和平台材质回退。
+- `emotionscreen/ui/window.py`：显式采音、后台分析到窗口显示的 Tk 主界面。
+
+Windows 尝试系统 Acrylic；macOS 和 Linux 使用明确标注的半透明卡片回退。系统减少动态效果或静态模式开启时直接显示，不播放渐入动画。

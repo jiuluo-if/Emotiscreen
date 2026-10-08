@@ -1,16 +1,18 @@
-"""Validated JSON configuration for EmotionScreen."""
+"""EmotiScreen 的轻量 JSON 配置和边界校验。"""
 
 from __future__ import annotations
 
 import json
+import ipaddress
 import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 
 class ConfigError(ValueError):
-    """Raised when configuration cannot be used safely."""
+    pass
 
 
 @dataclass(frozen=True)
@@ -23,138 +25,185 @@ class AudioConfig:
 
 
 @dataclass(frozen=True)
+class TranscriptConfig:
+    provider: str = "mock"
+    language: str = "zh-CN"
+
+
+@dataclass(frozen=True)
 class DecisionConfig:
     provider: str = "mock"
     clef_base_url: str = "http://127.0.0.1:8080"
     timeout_seconds: float = 5.0
-    interval_ms: int = 1_000
-    seed: int = 42
 
 
 @dataclass(frozen=True)
-class VisualConfig:
-    fps: int = 30
-    animation_enabled: bool = True
-    overlay_enabled: bool = False
+class ContextConfig:
+    max_turns: int = 6
 
 
 @dataclass(frozen=True)
-class EmotionConfig:
-    smoothing_alpha: float = 0.35
-    min_hold_ms: int = 1_500
-    confirm_count: int = 2
-    uncertain_fallback: str = "calm"
+class ResponseConfig:
+    celebrate_cooldown_seconds: float = 45.0
+    support_cooldown_seconds: float = 30.0
+    acknowledge_cooldown_seconds: float = 20.0
+    dedupe_seconds: float = 600.0
+    duration_seconds: float = 3.0
+
+
+@dataclass(frozen=True)
+class UIConfig:
+    language: str = "zh-CN"
+    theme: str = "system"
+    reduced_motion: bool = False
+    motion_strength: float = 0.35
 
 
 @dataclass(frozen=True)
 class AppConfig:
     mode: str = "mock"
     audio: AudioConfig = field(default_factory=AudioConfig)
+    transcript: TranscriptConfig = field(default_factory=TranscriptConfig)
     decision: DecisionConfig = field(default_factory=DecisionConfig)
-    visual: VisualConfig = field(default_factory=VisualConfig)
-    emotion: EmotionConfig = field(default_factory=EmotionConfig)
+    context: ContextConfig = field(default_factory=ContextConfig)
+    response: ResponseConfig = field(default_factory=ResponseConfig)
+    ui: UIConfig = field(default_factory=UIConfig)
 
 
-def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
-    defaults = {
-        "mode": "mock",
-        "audio": {"sample_rate": 16_000, "channels": 1, "frame_ms": 32, "window_seconds": 2.0, "device": None},
-        "decision": {
-            "provider": "mock", "clef_base_url": "http://127.0.0.1:8080", "timeout_seconds": 5.0,
-            "interval_ms": 1_000, "seed": 42,
-        },
-        "visual": {"fps": 30, "animation_enabled": True, "overlay_enabled": False},
-        "emotion": {"smoothing_alpha": 0.35, "min_hold_ms": 1_500, "confirm_count": 2, "uncertain_fallback": "calm"},
-    }
-    result = defaults
-    for section, values in raw.items():
-        if section not in result:
-            raise ConfigError(f"unknown configuration section: {section}")
+_DEFAULTS = {
+    "mode": "mock",
+    "audio": {"sample_rate": 16000, "channels": 1, "frame_ms": 32, "window_seconds": 2.0, "device": None},
+    "transcript": {"provider": "mock", "language": "zh-CN"},
+    "decision": {"provider": "mock", "clef_base_url": "http://127.0.0.1:8080", "timeout_seconds": 5.0},
+    "context": {"max_turns": 6},
+    "response": {
+        "celebrate_cooldown_seconds": 45.0,
+        "support_cooldown_seconds": 30.0,
+        "acknowledge_cooldown_seconds": 20.0,
+        "dedupe_seconds": 600.0,
+        "duration_seconds": 3.0,
+    },
+    "ui": {"language": "zh-CN", "theme": "system", "reduced_motion": False, "motion_strength": 0.35},
+}
+
+
+def _merge(raw: dict[str, Any]) -> dict[str, Any]:
+    values = {section: (dict(value) if isinstance(value, dict) else value) for section, value in _DEFAULTS.items()}
+    for section, supplied in raw.items():
+        if section not in values:
+            raise ConfigError(f"未知配置项：{section}")
         if section == "mode":
-            result[section] = values
+            values[section] = supplied
             continue
-        if not isinstance(values, dict):
-            raise ConfigError(f"{section} must be an object")
-        unknown = set(values) - set(result[section])
+        if not isinstance(supplied, dict):
+            raise ConfigError(f"{section} 必须是 JSON 对象")
+        unknown = set(supplied) - set(values[section])
         if unknown:
-            raise ConfigError(f"unknown {section} option(s): {', '.join(sorted(unknown))}")
-        result[section] = {**result[section], **values}
-    return result
+            raise ConfigError(f"{section} 存在未知字段：{', '.join(sorted(unknown))}")
+        values[section] = {**values[section], **supplied}
+    return values
 
 
 def load_config(path: str | Path = "config.json") -> AppConfig:
-    """Read config, falling back to portable defaults when the file is absent."""
     config_path = Path(path)
     try:
         raw = json.loads(config_path.read_text(encoding="utf-8")) if config_path.exists() else {}
     except (OSError, json.JSONDecodeError) as exc:
-        raise ConfigError(f"cannot read {config_path}: {exc}") from exc
+        raise ConfigError(f"无法读取配置 {config_path}：{exc}") from exc
     if not isinstance(raw, dict):
-        raise ConfigError("configuration root must be an object")
-    values = _merge_defaults(raw)
+        raise ConfigError("配置根节点必须是 JSON 对象")
+    values = _merge(raw)
     try:
-        audio = AudioConfig(**values["audio"])
-        decision = DecisionConfig(**values["decision"])
-        visual = VisualConfig(**values["visual"])
-        emotion = EmotionConfig(**values["emotion"])
+        config = AppConfig(
+            mode=values["mode"],
+            audio=AudioConfig(**values["audio"]),
+            transcript=TranscriptConfig(**values["transcript"]),
+            decision=DecisionConfig(**values["decision"]),
+            context=ContextConfig(**values["context"]),
+            response=ResponseConfig(**values["response"]),
+            ui=UIConfig(**values["ui"]),
+        )
     except TypeError as exc:
         raise ConfigError(str(exc)) from exc
-    cfg = AppConfig(mode=values["mode"], audio=audio, decision=decision, visual=visual, emotion=emotion)
-    _validate(cfg)
-    return cfg
+    _validate(config)
+    return config
 
 
-def _validate(cfg: AppConfig) -> None:
-    if not isinstance(cfg.mode, str) or cfg.mode not in {"mock", "live"}:
-        raise ConfigError("mode must be 'mock' or 'live'")
-    if not isinstance(cfg.decision.provider, str) or cfg.decision.provider not in {"mock", "clef"}:
-        raise ConfigError("decision.provider must be 'mock' or 'clef'")
-    if cfg.mode == "live" and cfg.decision.provider == "mock":
-        raise ConfigError("live mode requires decision.provider='clef'")
-    if cfg.mode == "mock" and cfg.decision.provider != "mock":
-        raise ConfigError("mock mode requires decision.provider='mock'")
+def _validate(config: AppConfig) -> None:
+    if not isinstance(config.mode, str) or config.mode not in {"mock", "live"}:
+        raise ConfigError("mode 只能是 mock 或 live")
+    if not isinstance(config.transcript.provider, str) or config.transcript.provider != "mock":
+        raise ConfigError("transcript.provider 目前只能是 mock；实时音频直接由 Python 分析")
+    if not isinstance(config.decision.provider, str) or config.decision.provider not in {"mock", "acoustic", "clef"}:
+        raise ConfigError("decision.provider 只能是 mock、acoustic 或 clef")
+    if config.mode == "mock" and config.decision.provider != "mock":
+        raise ConfigError("mock mode 必须使用 Mock 决策提供器")
+    if config.mode == "live" and config.decision.provider != "acoustic":
+        raise ConfigError("live mode 必须使用 acoustic 声学分析器")
+    if not isinstance(config.transcript.language, str) or config.transcript.language not in {"zh-CN", "en"} or not isinstance(config.ui.language, str) or config.ui.language not in {"zh-CN", "en"}:
+        raise ConfigError("language 目前只支持 zh-CN 和 en")
+    if not isinstance(config.ui.theme, str) or config.ui.theme not in {"system", "light", "dark"}:
+        raise ConfigError("ui.theme 只能是 system、light 或 dark")
+    if not isinstance(config.context.max_turns, int) or isinstance(config.context.max_turns, bool) or not 1 <= config.context.max_turns <= 20:
+        raise ConfigError("context.max_turns 必须在 1 到 20 之间")
+    if not isinstance(config.response.duration_seconds, (int, float)) or isinstance(config.response.duration_seconds, bool) or not 2 <= config.response.duration_seconds <= 4:
+        raise ConfigError("response.duration_seconds 必须在 2 到 4 秒之间")
+    if not isinstance(config.ui.motion_strength, (int, float)) or isinstance(config.ui.motion_strength, bool) or not 0 <= config.ui.motion_strength <= 1:
+        raise ConfigError("ui.motion_strength 必须在 0 到 1 之间")
     for name, value in (
-        ("visual.animation_enabled", cfg.visual.animation_enabled),
-        ("visual.overlay_enabled", cfg.visual.overlay_enabled),
+        ("ui.reduced_motion", config.ui.reduced_motion),
     ):
         if not isinstance(value, bool):
-            raise ConfigError(f"{name} must be a boolean")
-    if cfg.audio.device is not None and (not isinstance(cfg.audio.device, (str, int)) or isinstance(cfg.audio.device, bool)):
-        raise ConfigError("audio.device must be a device name, index, or null")
-    if not isinstance(cfg.decision.seed, int) or isinstance(cfg.decision.seed, bool):
-        raise ConfigError("decision.seed must be an integer")
-    for name, value, low, high in (
-        ("audio.sample_rate", cfg.audio.sample_rate, 8_000, 192_000),
-        ("audio.channels", cfg.audio.channels, 1, 2),
-        ("audio.frame_ms", cfg.audio.frame_ms, 10, 100),
-        ("visual.fps", cfg.visual.fps, 10, 60),
-        ("emotion.confirm_count", cfg.emotion.confirm_count, 1, 20),
+            raise ConfigError(f"{name} 必须是布尔值")
+    for field_name, value, low, high in (
+        ("audio.sample_rate", config.audio.sample_rate, 8000, 192000),
+        ("audio.channels", config.audio.channels, 1, 2),
+        ("audio.frame_ms", config.audio.frame_ms, 10, 100),
     ):
-        if not isinstance(value, int) or isinstance(value, bool):
-            raise ConfigError(f"{name} must be an integer")
-        if not low <= value <= high:
-            raise ConfigError(f"{name} must be between {low} and {high}")
-    for name, value, low, high in (
-        ("audio.window_seconds", cfg.audio.window_seconds, 0.25, 10.0),
-        ("decision.timeout_seconds", cfg.decision.timeout_seconds, 0.1, 60.0),
-        ("emotion.smoothing_alpha", cfg.emotion.smoothing_alpha, 0.0, 1.0),
+        if not isinstance(value, int) or isinstance(value, bool) or not low <= value <= high:
+            raise ConfigError(f"{field_name} 超出允许范围")
+    for field_name, value in (
+        ("audio.window_seconds", config.audio.window_seconds),
+        ("decision.timeout_seconds", config.decision.timeout_seconds),
+        ("response.celebrate_cooldown_seconds", config.response.celebrate_cooldown_seconds),
+        ("response.support_cooldown_seconds", config.response.support_cooldown_seconds),
+        ("response.acknowledge_cooldown_seconds", config.response.acknowledge_cooldown_seconds),
+        ("response.dedupe_seconds", config.response.dedupe_seconds),
+        ("response.duration_seconds", config.response.duration_seconds),
+        ("ui.motion_strength", config.ui.motion_strength),
     ):
-        if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value):
-            raise ConfigError(f"{name} must be a finite number")
-        if not low <= value <= high:
-            raise ConfigError(f"{name} must be between {low} and {high}")
-    if not isinstance(cfg.decision.interval_ms, int) or isinstance(cfg.decision.interval_ms, bool):
-        raise ConfigError("decision.interval_ms must be an integer")
-    if not 100 <= cfg.decision.interval_ms <= 60_000:
-        raise ConfigError("decision.interval_ms must be between 100 and 60000")
-    if not isinstance(cfg.emotion.min_hold_ms, int) or isinstance(cfg.emotion.min_hold_ms, bool):
-        raise ConfigError("emotion.min_hold_ms must be an integer")
-    if not 0 <= cfg.emotion.min_hold_ms <= 60_000:
-        raise ConfigError("emotion.min_hold_ms must be between 0 and 60000")
-    if not isinstance(cfg.emotion.uncertain_fallback, str) or cfg.emotion.uncertain_fallback not in {"calm", "uncertain"}:
-        raise ConfigError("emotion.uncertain_fallback must be 'calm' or 'uncertain'")
-    if cfg.decision.provider == "clef" and (
-        not isinstance(cfg.decision.clef_base_url, str)
-        or not cfg.decision.clef_base_url.startswith(("http://", "https://"))
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+            raise ConfigError(f"{field_name} 必须是有限数值")
+    for field_name, value in (
+        ("response.celebrate_cooldown_seconds", config.response.celebrate_cooldown_seconds),
+        ("response.support_cooldown_seconds", config.response.support_cooldown_seconds),
+        ("response.acknowledge_cooldown_seconds", config.response.acknowledge_cooldown_seconds),
+        ("response.dedupe_seconds", config.response.dedupe_seconds),
+        ("decision.timeout_seconds", config.decision.timeout_seconds),
+        ("audio.window_seconds", config.audio.window_seconds),
     ):
-        raise ConfigError("decision.clef_base_url must use http:// or https://")
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value) or value < 0:
+            raise ConfigError(f"{field_name} 必须是非负有限数值")
+    if not 0.1 <= config.decision.timeout_seconds <= 60:
+        raise ConfigError("decision.timeout_seconds 必须在 0.1 到 60 秒之间")
+    if not 0.25 <= config.audio.window_seconds <= 10:
+        raise ConfigError("audio.window_seconds 必须在 0.25 到 10 秒之间")
+    if config.audio.device is not None and (not isinstance(config.audio.device, (int, str)) or isinstance(config.audio.device, bool)):
+        raise ConfigError("audio.device 必须是设备名称、索引或 null")
+    if not _is_loopback_url(config.decision.clef_base_url):
+        raise ConfigError("decision.clef_base_url 必须指向本机 loopback 地址，不能发送转写到云端")
+
+
+def _is_loopback_url(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        parsed = urlsplit(value)
+        hostname = (parsed.hostname or "").lower().rstrip(".")
+        if parsed.scheme not in {"http", "https"} or not hostname or parsed.username or parsed.password:
+            return False
+        if hostname == "localhost":
+            return True
+        return ipaddress.ip_address(hostname).is_loopback
+    except ValueError:
+        return False
