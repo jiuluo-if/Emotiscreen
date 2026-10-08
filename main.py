@@ -19,7 +19,7 @@ from emotionscreen.core.transcript import MockTranscriptProvider
 
 def run_mock_check(config) -> int:
     transcript = MockTranscriptProvider().scenario("user_achievement", config.ui.language)
-    context = ConversationContext(config.context.max_turns)
+    context = ConversationContext(config.context.max_units)
     revision = context.append(transcript)
     request = DecisionRequest(context.snapshot(), revision, "user_achievement")
     decision = MockDecisionProvider().decide(request)

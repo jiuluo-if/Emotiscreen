@@ -14,7 +14,7 @@
 
 ## 系统通知插件
 
-参考 [tauri-apps/plugins-workspace 的 notification 插件](https://github.com/tauri-apps/plugins-workspace/tree/v2/plugins/notification)。系统通知插件适合标准通知，但 EmotiScreen 需要可拖动、可关闭、数秒自动隐藏并呈现特定材质的浮层，因此保留自绘 ComfortWindow；普通通知不替代这里的窗口。
+参考 [tauri-apps/plugins-workspace 的 notification 插件](https://github.com/tauri-apps/plugins-workspace/tree/v2/plugins/notification)。系统通知插件适合离散通知，但 EmotiScreen 的 live 模式需要常驻玻璃主题层，且在连续状态变化时更新颜色和短句；手工文本预览才短时自动隐藏。因此保留自绘 ComfortWindow，普通系统通知不能替代这里的视觉状态层。
 
 ## 本轮实际采用的上游代码片段
 
@@ -23,7 +23,7 @@
 | 上游项目与源码 | 许可证 | 借用点 | EmotiScreen 的本地改动 |
 |---|---|---|---|
 | [pyAudioAnalysis `ShortTermFeatures.py`](https://github.com/tyiannak/pyAudioAnalysis/blob/master/pyAudioAnalysis/ShortTermFeatures.py) | Apache-2.0 | 短帧能量、过零率、频谱重心/通量和自相关基频的计算思路 | 仅采用实时陪伴需要的少量统计；保留 NumPy，删除 MFCC/分类器/文件批处理等路径；音频只驻留在内存；质量不足则输出 uncertain。源码概览见 [feature extraction 文档](https://github.com/tyiannak/pyAudioAnalysis/wiki/3.-feature-extraction)。 |
-| [TkAnimator `tk_animations.py`](https://github.com/itsDevlune/TkAnimator/blob/main/tk_animations.py) | MIT | `animate_fade_in`/`animate_fade_out` 的分步透明度插值，`animate_pulse` 的正弦缓动思路 | 只把相关步进/曲线用于 Tk Toplevel 与 Canvas glow；用可取消的 `after` 驱动，适配 Acrylic 透明度、关闭/暂停和系统减少动态效果，不带入动画库其他效果。 |
+| [TkAnimator `tk_animations.py`](https://github.com/itsDevlune/TkAnimator/blob/main/tk_animations.py) | MIT | `animate_fade_in`/`animate_fade_out` 的分步透明度、`animate_pulse` 正弦曲线、`animate_color_transition` 的 RGB 线性插值 | 只把相关步进/曲线用于 Tk Toplevel 与 Canvas glow/情绪渐变；用可取消的 `after` 驱动，适配 Acrylic tint、短句渐变和系统减少动态效果，不带入动画库其他效果。 |
 | [CTkMessagebox `ctkmessagebox.py`](https://github.com/Akascape/CTkMessagebox/blob/main/CTkMessagebox/ctkmessagebox.py) | CC0-1.0 | `oldxyset`/`move_window` 的按下锚点与根坐标拖动方式、淡入淡出时长配置思路 | 适配到原生 Tk Canvas 的卡片拖动；沿用项目自己的关闭控件、无焦点和窗口位置，不引入 CustomTkinter/Pillow，也不复制消息框布局。 |
 | [window-vibrancy 0.7.1 `src/windows.rs`](https://docs.rs/crate/window-vibrancy/0.7.1/source/src/windows.rs) 与 [README](https://github.com/tauri-apps/window-vibrancy) | Apache-2.0/MIT 双许可 | Windows `ACCENT_POLICY`/`WINDOWCOMPOSITIONATTRIBDATA` 结构、Acrylic state/flags、版本门槛及平台材质能力 | 将 FFI 声明翻译到 Python ctypes，保留 Acrylic 渐变 alpha 和无效 API 回退；没有复制 Rust/Tauri crate。 |
 | [llama.cpp server README](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md) | MIT | Clef System One 的本机 `state/questions` 接口约束 | 只用于开发面板里的手工文本决策；实时音频不进入 Clef，也不走 ASR。 |

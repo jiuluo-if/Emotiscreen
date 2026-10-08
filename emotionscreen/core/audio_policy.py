@@ -1,32 +1,20 @@
-"""Conservative feedback gate for acoustic estimates."""
+"""Map stable acoustic states to a persistent local theme and short phrase."""
 
 from __future__ import annotations
 
-from collections import OrderedDict
-from hashlib import sha256
-import time
-from typing import Callable
-
 from .acoustic import AudioStateTransition
-from .i18n import response_phrase
+from .i18n import text
 from .models import ResponseEvent
+
+_STATE_COPY = {
+    "low_arousal": ("support", "audio_low_phrase", "gentle"),
+    "elevated": ("acknowledge", "audio_elevated_phrase", "subtle"),
+    "uncertain": ("listen", "audio_uncertain_phrase", "subtle"),
+}
 
 
 class AudioFeedbackPolicy:
-    def __init__(
-        self,
-        *,
-        cooldown_seconds: float = 30.0,
-        dedupe_seconds: float = 600.0,
-        duration_seconds: float = 3.0,
-        clock: Callable[[], float] = time.monotonic,
-    ) -> None:
-        self.cooldown_seconds = cooldown_seconds
-        self.dedupe_seconds = dedupe_seconds
-        self.duration_seconds = min(4.0, max(2.0, duration_seconds))
-        self._clock = clock
-        self._last_shown = float("-inf")
-        self._seen: OrderedDict[str, float] = OrderedDict()
+    """为每次已确认的声学状态变化创建一个常驻界面事件。"""
 
     def evaluate(
         self,
@@ -36,58 +24,24 @@ class AudioFeedbackPolicy:
         listening: bool = True,
         dnd: bool = False,
         paused: bool = False,
-        popup_active: bool = False,
-        now: float | None = None,
     ) -> ResponseEvent | None:
-        current = self._clock() if now is None else now
-        if transition is None:
+        if transition is None or not listening or dnd or paused:
             return None
-        analysis = transition.analysis
-        entered_low_from_elevated = transition.previous_state == "elevated" and transition.state == "low_arousal"
-        if (
-            analysis.quality != "usable"
-            or analysis.state != "low_arousal"
-            or analysis.score < 0.70
-            or transition.state != "low_arousal"
-            or not entered_low_from_elevated
-            or not listening
-            or dnd
-            or paused
-            or popup_active
-        ):
+        if transition.state not in _STATE_COPY:
             return None
-        self._expire(current)
-        key = self._event_key(analysis)
-        if key in self._seen or current - self._last_shown < self.cooldown_seconds:
-            return None
-        self._seen[key] = current
-        if len(self._seen) > 256:
-            self._seen.popitem(last=False)
-        self._last_shown = current
+        if transition.state != "uncertain":
+            analysis = transition.analysis
+            if analysis.quality != "usable" or analysis.score < 0.70:
+                return None
+
+        action, phrase_key, intensity = _STATE_COPY[transition.state]
         return ResponseEvent(
-            action="support",
-            phrase=response_phrase("support", language),
-            intensity="gentle",
-            event_id=key,
-            duration_seconds=self.duration_seconds,
+            action=action,
+            phrase=text(phrase_key, language),
+            intensity=intensity,
+            event_id=f"audio-{transition.previous_state}-{transition.state}",
+            duration_seconds=0.0,
             language=language,
+            state=transition.state,
+            persistent=True,
         )
-
-    def _expire(self, now: float) -> None:
-        while self._seen:
-            _, seen_at = next(iter(self._seen.items()))
-            if now - seen_at <= self.dedupe_seconds:
-                break
-            self._seen.popitem(last=False)
-
-    @staticmethod
-    def _event_key(analysis: AcousticAnalysis) -> str:
-        features = analysis.features
-        identity = (
-            analysis.state,
-            round(features.rms, 3),
-            round(features.rms_variation, 2),
-            round(features.median_pitch_hz or 0, 0),
-            round(features.pitch_range_hz or 0, 0),
-        )
-        return sha256(repr(identity).encode("utf-8")).hexdigest()

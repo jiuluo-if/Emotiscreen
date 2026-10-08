@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 import tkinter as tk
 from tkinter import ttk
 from pathlib import Path
@@ -22,22 +23,18 @@ from ..core.policy import ResponsePolicy
 from ..core.runtime import ConversationRuntime
 from ..core.transcript import MockTranscriptProvider
 from .comfort_window import ComfortWindow
-from .glass import should_reduce_motion
+from .glass import emotion_palette, interpolate_color, should_reduce_motion
 
 
 _SCENARIOS = (
     "user_achievement", "user_praise", "user_sadness", "small_progress", "ordinary_chat",
     "sarcasm", "other_person", "incomplete", "uncertain",
 )
-
-
-def _rounded_rectangle(canvas, x1: float, y1: float, x2: float, y2: float, radius: float, fill: str, outline: str = "") -> int:
-    points = [
-        x1 + radius, y1, x2 - radius, y1, x2, y1, x2, y1 + radius,
-        x2, y2 - radius, x2, y2, x2 - radius, y2, x1 + radius, y2,
-        x1, y2, x1, y2 - radius, x1, y1 + radius, x1, y1,
-    ]
-    return canvas.create_polygon(points, smooth=True, splinesteps=16, fill=fill, outline=outline, width=1)
+_AUDIO_STATE_LABEL = {
+    "low_arousal": "audio_state_low",
+    "elevated": "audio_state_elevated",
+    "uncertain": "audio_state_uncertain",
+}
 
 
 class EmotionWindow:
@@ -60,6 +57,9 @@ class EmotionWindow:
         self._static = config.ui.reduced_motion or should_reduce_motion()
         self._motion_strength = config.ui.motion_strength
         self._preview_action = "support"
+        self._preview_state = "uncertain"
+        self._audio_state = "uncertain"
+        self._audio_overlay_dismissed = False
         self._audio: SoundDeviceAudioInput | None = None
         self._audio_buffer: AudioRingBuffer | None = None
         self._audio_worker: AudioAnalysisWorker | None = None
@@ -67,7 +67,7 @@ class EmotionWindow:
         self._last_audio_submit = 0.0
         self._audio_file_preview = False
         self._transcripts = MockTranscriptProvider()
-        self._context = ConversationContext(max_turns=config.context.max_turns)
+        self._context = ConversationContext(max_units=config.context.max_units)
         self._policy = ResponsePolicy(
             cooldown_seconds={
                 "celebrate": config.response.celebrate_cooldown_seconds,
@@ -77,11 +77,7 @@ class EmotionWindow:
             dedupe_seconds=config.response.dedupe_seconds,
             duration_seconds=config.response.duration_seconds,
         )
-        self._audio_policy = AudioFeedbackPolicy(
-            cooldown_seconds=config.response.support_cooldown_seconds,
-            dedupe_seconds=config.response.dedupe_seconds,
-            duration_seconds=config.response.duration_seconds,
-        )
+        self._audio_policy = AudioFeedbackPolicy()
         self.runtime = self._new_runtime(self._provider_name)
         self._build_ui()
         # Map the main window first so the initially withdrawn toast cannot become the first active top-level.
@@ -93,6 +89,7 @@ class EmotionWindow:
             reduced_motion=self._static,
             motion_strength=self._motion_strength,
             theme=self._theme,
+            on_dismiss=self._on_comfort_dismiss,
         )
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         self._apply_theme()
@@ -235,6 +232,23 @@ class EmotionWindow:
                 return scenario
         return "user_achievement"
 
+    @staticmethod
+    def _state_for_action(action: str) -> str:
+        return {"support": "low_arousal", "acknowledge": "elevated", "celebrate": "elevated"}.get(action, "uncertain")
+
+    def _refresh_context_status(self, *, rule_score: float | None = None) -> None:
+        if not hasattr(self, "provider_status_var"):
+            return
+        count = f"{self._context.used_units}/{self._context.max_units}"
+        if self.config.mode == "live":
+            label_key = _AUDIO_STATE_LABEL.get(self._audio_state, "audio_state_uncertain")
+            label = text(label_key, self._language)
+            if rule_score is not None:
+                label += f" · {text('rule_score', self._language)} {rule_score:.0%}"
+        else:
+            label = text("mock_mode" if self._provider_name == "mock" else "clef_mode", self._language)
+        self.provider_status_var.set(f"{label} · {count}")
+
     def _schedule_tick(self) -> None:
         if not self._closed:
             self._after_id = self.root.after(33, self._tick)
@@ -254,30 +268,57 @@ class EmotionWindow:
         if self._audio_worker is not None:
             for result in self._audio_worker.poll():
                 analysis = result.analysis
-                transition = self._audio_states.update(
-                    analysis,
-                    required_confirmations=1 if self._audio_file_preview else None,
+                audio_is_active = (self._listening and not self._paused) or self._audio_file_preview
+                transition = (
+                    self._audio_states.update(
+                        analysis,
+                        required_confirmations=1 if self._audio_file_preview else None,
+                    )
+                    if audio_is_active else None
                 )
                 self.decision_var.set(
                     f"稳定状态 {self._audio_states.state} · 当前窗 {analysis.state} · "
                     f"quality {analysis.quality} · 规则分 {analysis.score:.0%} · {analysis.note}"
                 )
-                self.provider_status_var.set(f"{self._audio_states.state} · {analysis.score:.0%}")
+                self._audio_state = self._audio_states.state
+                self._refresh_context_status(rule_score=analysis.score)
                 if transition is not None:
+                    state_summary = TranscriptSegment(
+                        text=text(
+                            _AUDIO_STATE_LABEL.get(transition.state, "audio_state_uncertain"),
+                            self._language,
+                        ),
+                        language=self._language,
+                        speaker="user",
+                        source="acoustic",
+                    )
+                    self._context.append(state_summary)
+                    self._audio_state = transition.state
                     event = self._audio_policy.evaluate(
                         transition,
                         language=self._language,
                         listening=self._listening or self._audio_file_preview,
                         dnd=self._dnd,
                         paused=self._paused,
-                        popup_active=self.comfort.visible,
                     )
                     if event is not None:
                         self._preview_action = event.action
+                        self._audio_state = event.state or self._audio_state
+                        self._preview_state = self._audio_state
+                        if self._audio_file_preview:
+                            event = replace(event, persistent=False, duration_seconds=4.0)
                         self._draw_preview()
-                        self.comfort.show(event)
-                    elif transition.previous_state == "low_arousal" and self.comfort.visible:
-                        self.comfort.hide()
+                        if not self._audio_overlay_dismissed or self._audio_file_preview:
+                            self.comfort.show(event)
+                            self._context.append(
+                                TranscriptSegment(
+                                    text=event.phrase,
+                                    language=self._language,
+                                    speaker="assistant",
+                                    source="assistant",
+                                )
+                            )
+                    self._refresh_context_status(rule_score=analysis.score)
                 self._audio_file_preview = False
             if self._audio_worker.last_error:
                 self.provider_status_var.set("分析失败")
@@ -287,12 +328,25 @@ class EmotionWindow:
             language=self._language,
             dnd=self._dnd,
             paused=self._paused,
-            popup_active=self.comfort.visible,
+            popup_active=self.comfort.visible and not self.comfort.persistent,
             listening=self._listening,
         ):
             self._preview_action = event.action
+            self._audio_state = self._state_for_action(event.action)
+            self._preview_state = self._audio_state
+            if self._listening and self.config.mode == "live":
+                event = replace(event, persistent=True, state=self._audio_state)
             self._draw_preview()
             self.comfort.show(event)
+            self._context.append(
+                TranscriptSegment(
+                    text=event.phrase,
+                    language=self._language,
+                    speaker="assistant",
+                    source="assistant",
+                )
+            )
+            self._refresh_context_status()
         decision = self.runtime.last_decision
         if self._developer_mode and decision is not None:
             confidence = decision.confidence.get("response") if decision.confidence else None
@@ -366,6 +420,12 @@ class EmotionWindow:
                 return
         self._listening = True
         self._paused = False
+        if self.config.mode == "live":
+            self._audio_state = "uncertain"
+            self._preview_state = "uncertain"
+            self._audio_overlay_dismissed = False
+            self.comfort.show_audio_state("uncertain", self._language)
+            self._draw_preview()
         self._refresh_status()
 
     def toggle_pause(self) -> None:
@@ -375,10 +435,21 @@ class EmotionWindow:
         if self._paused and self._audio is not None:
             self._audio.stop()
             self._audio_states.reset()
-            self.comfort.dismiss()
+            self._audio_state = "uncertain"
+            self._preview_state = "uncertain"
+            self.comfort.hide()
+            self._draw_preview()
         elif not self._paused and self._audio is not None:
             try:
                 self._audio.start()
+                self._audio_buffer = AudioRingBuffer(round(self.config.audio.sample_rate * self.config.audio.window_seconds))
+                self._last_audio_submit = 0.0
+                self._audio_states.reset()
+                self._audio_state = "uncertain"
+                self._preview_state = "uncertain"
+                self._audio_overlay_dismissed = False
+                self.comfort.show_audio_state("uncertain", self._language)
+                self._draw_preview()
             except Exception as exc:
                 self.api_var.set(f"麦克风恢复失败：{exc}")
                 self.stop_listening()
@@ -390,7 +461,10 @@ class EmotionWindow:
         self._paused = False
         if self.config.mode == "live":
             self._audio_states.reset()
-            self.comfort.dismiss()
+            self._audio_state = "uncertain"
+            self._preview_state = "uncertain"
+            self.comfort.hide()
+            self._draw_preview()
         if self._audio is not None:
             try:
                 self._audio.stop()
@@ -401,7 +475,10 @@ class EmotionWindow:
     def toggle_dnd(self) -> None:
         self._dnd = self.dnd_var.get()
         if self._dnd:
-            self.comfort.dismiss()
+            self.comfort.hide()
+        elif self._listening and not self._paused and self.config.mode == "live":
+            self._audio_overlay_dismissed = False
+            self.comfort.show_audio_state(self._audio_states.state, self._language)
         self._refresh_status()
 
     def toggle_static(self) -> None:
@@ -439,7 +516,7 @@ class EmotionWindow:
             if selected == "clef"
             else MockDecisionProvider()
         )
-        self.provider_status_var.set(text("mock_mode" if selected == "mock" else "clef_mode", self._language))
+        self._refresh_context_status()
         self.api_var.set("")
 
     def simulate_scenario(self) -> None:
@@ -460,11 +537,17 @@ class EmotionWindow:
         request = self.runtime.ingest(segment, scenario_id)
         if request is not None:
             self.decision_var.set(f"context #{request.context_revision} · {self._provider_name} · {segment.text}")
+            self._refresh_context_status()
 
     def preview_response(self) -> None:
         action = self._preview_action
+        self._preview_state = self._state_for_action(action)
         event = ResponseEvent(action, text(action, self._language), "gentle", "preview", 3.0, self._language)
+        self._draw_preview()
         self.comfort.show(event)
+
+    def _on_comfort_dismiss(self) -> None:
+        self._audio_overlay_dismissed = True
 
     def _refresh_text(self) -> None:
         if not hasattr(self, "widgets"):
@@ -515,13 +598,15 @@ class EmotionWindow:
             status = text("status_mock", self._language)
         self.status_var.set(status)
         if hasattr(self, "header_status_var"):
-            mode_label = "LIVE AUDIO" if self.config.mode == "live" else "MOCK" if self._provider_name == "mock" else "CLEF"
+            if self.config.mode == "live":
+                mode_label = "PAUSED" if self._paused else "LIVE AUDIO" if self._listening else "LIVE READY"
+            else:
+                mode_label = "MOCK" if self._provider_name == "mock" else "CLEF"
             self.header_status_var.set("• " + mode_label)
         color = "#C7A96B" if self._dnd else "#76A891" if self._listening and not self._paused else "#A6AFBC"
         self.status_dot.itemconfigure("dot", fill=color)
         if hasattr(self, "provider_status_var"):
-            provider_key = "acoustic_mode" if self.config.mode == "live" else "mock_mode" if self._provider_name == "mock" else "clef_mode"
-            self.provider_status_var.set(text(provider_key, self._language))
+            self._refresh_context_status()
 
     def _draw_preview(self, _event=None) -> None:
         if not hasattr(self, "preview_canvas"):
@@ -530,34 +615,44 @@ class EmotionWindow:
         width = max(300, min(self.preview_canvas.winfo_width(), max(360, self.root.winfo_width() - 60)))
         height = max(250, self.preview_canvas.winfo_height())
         dark = self._theme == "dark"
-        bg = "#202A38" if dark else "#EEF2F7"
-        ink = "#EEF2F8" if dark else "#34455B"
-        muted = "#A7B3C3" if dark else "#718199"
-        card = "#293545" if dark else "#FCFDFE"
-        border = "#3A485A" if dark else "#FFFFFF"
-        action_color = {
-            "support": "#8FA4C3" if dark else "#718AAE",
-            "celebrate": "#E0B563" if dark else "#C7913F",
-            "acknowledge": "#8FB6A3" if dark else "#648E7B",
-        }.get(self._preview_action, "#8FA4C3")
-        self.preview_canvas.configure(bg=bg)
-        self.preview_canvas.create_text(26, 20, anchor="w", text=text("preview_caption", self._language).upper(), fill=muted, font=("Segoe UI", 8, "bold"))
-        self.preview_canvas.create_oval(width - 185, 12, width - 55, 142, fill="#607797" if dark else "#D4DFEC", outline="", stipple="gray50")
-        self.preview_canvas.create_oval(24, height - 118, 118, height - 24, fill="#8196B3" if dark else "#DCE5EF", outline="", stipple="gray50")
-        card_width = min(490, width - 60)
-        card_height = 154
-        x1 = (width - card_width) / 2
-        y1 = (height - card_height) / 2 + 10
-        for offset, color in ((7, "#C9D3E0" if not dark else "#141B24"), (4, "#D5DDE7" if not dark else "#19212C")):
-            _rounded_rectangle(self.preview_canvas, x1 + offset, y1 + offset, x1 + card_width + offset, y1 + card_height + offset, 24, color)
-        _rounded_rectangle(self.preview_canvas, x1, y1, x1 + card_width, y1 + card_height, 24, card, border)
-        self.preview_canvas.create_oval(x1 + 25, y1 + 28, x1 + 67, y1 + 70, fill=action_color, outline="")
-        icon = "♥" if self._preview_action == "support" else "✦" if self._preview_action == "celebrate" else "•"
-        self.preview_canvas.create_text(x1 + 46, y1 + 48, text=icon, fill="#FFFFFF", font=("Segoe UI Symbol", 17, "bold"))
-        self.preview_canvas.create_text(x1 + 84, y1 + 36, anchor="w", text=text(f"tag_{self._preview_action}", self._language).upper(), fill=muted, font=("Segoe UI", 8, "bold"))
-        self.preview_canvas.create_text(x1 + 84, y1 + 78, anchor="w", text=text(self._preview_action, self._language), fill=ink, font=("Microsoft YaHei UI", 24, "bold"))
-        self.preview_canvas.create_line(x1 + 26, y1 + 112, x1 + card_width - 26, y1 + 112, fill=border, width=1)
-        self.preview_canvas.create_text(x1 + 26, y1 + 132, anchor="w", text=text("privacy_hint", self._language), fill=muted, font=("Microsoft YaHei UI", 9))
+        background = "#1E2938" if dark else "#E9EEF4"
+        self.preview_canvas.configure(bg=background)
+        palette = emotion_palette(self._preview_state, self._theme)
+        columns = 100
+        for index in range(columns):
+            amount = index / max(1, columns - 1)
+            x0 = width * index / columns
+            x1 = width * (index + 1) / columns + 1
+            self.preview_canvas.create_rectangle(
+                x0, 0, x1, height,
+                fill=interpolate_color(palette.start, palette.end, amount), outline="",
+            )
+        self.preview_canvas.create_oval(
+            width - 230, -25, width + 10, 215,
+            fill=interpolate_color(palette.end, palette.accent, 0.28), outline="",
+        )
+        self.preview_canvas.create_oval(
+            -90, height - 160, 170, height + 90,
+            fill=interpolate_color(palette.start, palette.end, 0.24), outline="",
+        )
+        self.preview_canvas.create_text(
+            30, 28, anchor="w", text=text("preview_caption", self._language).upper(),
+            fill=palette.muted, font=("Segoe UI", 8, "bold"),
+        )
+        self.preview_canvas.create_text(
+            30, 76, anchor="w",
+            text=text(_AUDIO_STATE_LABEL.get(self._preview_state, "audio_state_uncertain"), self._language),
+            fill=palette.text, font=("Segoe UI", 10, "bold"),
+        )
+        phrase_key = {
+            "low_arousal": "audio_low_phrase",
+            "elevated": "audio_elevated_phrase",
+            "uncertain": "audio_uncertain_phrase",
+        }.get(self._preview_state, "audio_uncertain_phrase")
+        self.preview_canvas.create_text(
+            30, 130, anchor="w", width=max(260, width - 80), text=text(phrase_key, self._language),
+            fill=palette.text, font=("Microsoft YaHei UI", 23, "bold"),
+        )
 
     def _apply_theme(self) -> None:
         dark = self._theme == "dark"

@@ -1,27 +1,27 @@
 # EmotiScreen 当前进度
 
-## 目标
+## 本轮交付
 
-将现有 Python/Tkinter 桌面项目接通为本地音频分析→连续状态变化→反馈策略→渐入安抚窗口。不使用 ASR；只适配开源代码中的必要片段，不克隆完整仓库或依赖树。
+- 实时音频不使用 ASR；用户点击开始后，`sounddevice` 将短帧送入有界内存缓冲，由单个后台 worker 用 NumPy 声学特征分析，再由状态跟踪器和反馈策略驱动 Tk 浮层。
+- 监听时玻璃浮层常驻，底色沿双色渐变缓慢流动、光晕呼吸；稳定状态切换时整片渐变约 0.8 秒平滑换色并更新本地短句。默认动效强度 0.72，静态模式可关闭动画。
+- Windows 浮层位置会按显示缩放系数换算，避免 150% 缩放下窗口移出屏幕。浮层可拖动，不抢键盘焦点；暂停、免打扰、停止和关闭仍可控制。
+- 会话文本仅留在当前进程内存，总预算最多 2000 单位：中文按字符，英文按本地词法 token；启动为空，关闭即清除。
+- 开源实现只取 pyAudioAnalysis 的声学统计、TkAnimator 的颜色插值/步进/正弦脉冲、CTkMessagebox 的拖动锚点和 window-vibrancy 的 Acrylic FFI 结构。来源、许可证与修改位置列于 `THIRD_PARTY_NOTICES.md` 和 `docs/opensource-guidance.md`，没有克隆完整仓库或引入完整上游 GUI。
 
-## 已完成
+## 验证证据
 
-- 删除实时 ASR loader/adapter 和轮询；Mock 默认不启动麦克风，live 模式由 sounddevice 输入 + NumPy 特征直接处理。
-- 复用并改写 pyAudioAnalysis 的短帧能量、过零率、频谱、自相关特征片段；保留 gain normalization、质量门控和低/高唤醒/不确定状态。
-- 单后台 worker 处理最新音频窗；`AudioStateTracker` 要求连续两个窗口确认，只有 elevated→low_arousal 才弹 support，离开状态后渐隐。
-- WAV 试听只接受 10 秒以内单/双声道 16-bit PCM；音频始终只驻留内存。
-- 按 TkAnimator、CTkMessagebox、window-vibrancy 片段适配透明度渐变、低幅脉冲、拖动和 Acrylic FFI；许可证及差异记在 `THIRD_PARTY_NOTICES.md`、`licenses/` 和 `docs/opensource-guidance.md`。
-- 从官方 RAVDESS 16 kHz 归档的临时前缀抽出 Actor 01 的 24 段 WAV。neutral/calm/sad 都大多归入 low_arousal，说明当前规则不能区分语义情绪，准确率标记为未知。
-- 真实 RAVDESS 高唤醒片段接悲伤片段，通过同一后台 worker、状态跟踪与策略，在 Tk 窗口中实际显示 support 卡片并渐入。
-
-## 最新验证
-
-- 目标测试：14 passed。
+- 精简相关测试：16 passed。
+- `python main.py --check`：Mock 情境管线通过；合成音频验证 `elevated → low_arousal → support`。
 - `python -m compileall -q emotionscreen main.py`：通过。
-- `python main.py --check`：Mock 与 elevated→low_arousal 合成信号反馈链路通过。
-- `git diff --check`：通过；实时 mic 硬件采集尚未测试。
+- Windows Tk 窗口实测：RAVDESS Actor 01 高强度 happy WAV 经后台分析为 elevated (0.720)，连续两窗确认后切到低强度 sad WAV 的 low_arousal (0.706)，反馈依次为 acknowledge 与 support；玻璃浮层持续显示并换色。
+- 两次相隔 0.8 秒的屏幕采样在浮层所在区域检测到 31,246 个变化像素；运行窗口保持可交互。
+- `git diff --check`：通过。
 
-## 交付
+## 已知边界
 
-- 代码审查无阻断项；以邮箱 `2966684515@qq.com`、提交信息 `feat: 接通本地声学状态与渐入安抚反馈` 创建提交 `ea74e2ad4563a2b1e09bfa7b1f974f044ff5ba98`。
-- 已推送 `main`，推送后本地/远端 SHA 一致，工作树干净。
+- 当前声学规则是唤醒度代理，不是语义情绪识别；Actor 01 的 RAVDESS 探索样本显示 neutral、calm、sad 存在重叠。准确率仍未知，不作悲伤/开心等分类承诺。
+- 尚未在目标设备上验证真实麦克风、驱动差异或连续长时监听；实时录音仅在用户主动开始后启用。
+
+## 发布状态
+
+- 当前分支为 `main`。本轮按要求使用邮箱 `2966684515@qq.com` 和“英文前缀：中文内容”提交，并推送到 `origin/main`；SHA 以 Git 提交记录和远端核验结果为准。

@@ -39,7 +39,7 @@ class DecisionConfig:
 
 @dataclass(frozen=True)
 class ContextConfig:
-    max_turns: int = 6
+    max_units: int = 2_000
 
 
 @dataclass(frozen=True)
@@ -56,7 +56,7 @@ class UIConfig:
     language: str = "zh-CN"
     theme: str = "system"
     reduced_motion: bool = False
-    motion_strength: float = 0.35
+    motion_strength: float = 0.72
 
 
 @dataclass(frozen=True)
@@ -75,7 +75,7 @@ _DEFAULTS = {
     "audio": {"sample_rate": 16000, "channels": 1, "frame_ms": 32, "window_seconds": 2.0, "device": None},
     "transcript": {"provider": "mock", "language": "zh-CN"},
     "decision": {"provider": "mock", "clef_base_url": "http://127.0.0.1:8080", "timeout_seconds": 5.0},
-    "context": {"max_turns": 6},
+    "context": {"max_units": 2000},
     "response": {
         "celebrate_cooldown_seconds": 45.0,
         "support_cooldown_seconds": 30.0,
@@ -83,7 +83,7 @@ _DEFAULTS = {
         "dedupe_seconds": 600.0,
         "duration_seconds": 3.0,
     },
-    "ui": {"language": "zh-CN", "theme": "system", "reduced_motion": False, "motion_strength": 0.35},
+    "ui": {"language": "zh-CN", "theme": "system", "reduced_motion": False, "motion_strength": 0.72},
 }
 
 
@@ -144,8 +144,8 @@ def _validate(config: AppConfig) -> None:
         raise ConfigError("language 目前只支持 zh-CN 和 en")
     if not isinstance(config.ui.theme, str) or config.ui.theme not in {"system", "light", "dark"}:
         raise ConfigError("ui.theme 只能是 system、light 或 dark")
-    if not isinstance(config.context.max_turns, int) or isinstance(config.context.max_turns, bool) or not 1 <= config.context.max_turns <= 20:
-        raise ConfigError("context.max_turns 必须在 1 到 20 之间")
+    if not isinstance(config.context.max_units, int) or isinstance(config.context.max_units, bool) or not 1 <= config.context.max_units <= 2000:
+        raise ConfigError("context.max_units 必须在 1 到 2000 之间")
     if not isinstance(config.response.duration_seconds, (int, float)) or isinstance(config.response.duration_seconds, bool) or not 2 <= config.response.duration_seconds <= 4:
         raise ConfigError("response.duration_seconds 必须在 2 到 4 秒之间")
     if not isinstance(config.ui.motion_strength, (int, float)) or isinstance(config.ui.motion_strength, bool) or not 0 <= config.ui.motion_strength <= 1:

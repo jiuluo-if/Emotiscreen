@@ -1,16 +1,18 @@
-# EmotiScreen 音频分析到渐入安抚反馈 Implementation Plan
+# EmotiScreen 音频分析到渐入安抚反馈实施计划
 
-> **For agentic workers:** Inline execution in this session. Steps use checkbox (`- [ ]`) syntax for tracking.
+> 历史实施计划：初版V0.3验收已完成；后续 UI/连续主题/上下文任务见 `2026-10-08-emotiscreen-ambient-ui.md`。
 
-**Goal:** 从用户主动开启的本地音频输入，经 Python 声学分析与保守门控，驱动渐入安抚窗口；不使用 ASR。
+> 本计划在当前会话中直接实施，使用复选框记录步骤。
 
-**Architecture:** 从 pyAudioAnalysis 选取并改写短帧特征算法，NumPy 分析器输出质量标记与 fail-closed 状态；从 TkAnimator/CTkMessagebox 选取渐变/脉冲/拖动片段适配到当前窗口。Tk 主线程通过单后台 worker 投递音频快照，`AudioFeedbackPolicy` 管理回应节制，复用现有 `ComfortWindow`。
+**目标：** 从用户主动开启的本地音频输入，经 Python 声学分析与保守门控，驱动渐入安抚窗口；不使用 ASR。
 
-**Tech Stack:** Python 3.11+、NumPy、Tkinter、可选 sounddevice；不新增情绪模型、ASR、数据库或云依赖。
+**架构：** 从 pyAudioAnalysis 选取并改写短帧特征算法，NumPy 分析器输出质量标记与 fail-closed 状态；从 TkAnimator/CTkMessagebox 选取渐变/脉冲/拖动片段适配到当前窗口。Tk 主线程通过单后台 worker 投递音频快照，`AudioFeedbackPolicy` 管理回应节制，复用现有 `ComfortWindow`。
 
-**Spec:** `docs/superpowers/specs/2026-10-08-emotiscreen-v03-design.md`
+**技术栈：** Python 3.11+、NumPy、Tkinter、可选 sounddevice；不新增情绪模型、ASR、数据库或云依赖。
 
-## Global Constraints
+**设计文档：** `docs/superpowers/specs/2026-10-08-emotiscreen-v03-design.md`
+
+## 全局约束
 
 - 音频只在内存中处理，不写盘、不上传。
 - 麦克风仅在用户明确启动后读取；暂停、停止和 DND 优先于迟到结果。
@@ -20,36 +22,36 @@
 
 ---
 
-## Task 1：声学特征与保守估计
+## 任务 1：声学特征与保守估计
 
-**Files:**
+**涉及文件：**
 - Create: `emotionscreen/core/acoustic.py`
 - Modify: `emotionscreen/core/models.py`
 - Test: `tests/test_pipeline.py`
 
-**Interfaces:** `AcousticEmotionAnalyzer.analyze(samples: np.ndarray, sample_rate: int) -> AcousticAnalysis`; analysis 包含有效性、声学特征、粗粒度状态、未校准规则分和短说明。
+**接口：** `AcousticEmotionAnalyzer.analyze(samples: np.ndarray, sample_rate: int) -> AcousticAnalysis`; analysis 包含有效性、声学特征、粗粒度状态、未校准规则分和短说明。
 
 - [x] 为稳定低频音、变调信号、静音、增益变化和过短片段写精简确定性测试，并先运行确认新增行为失败。
 - [x] 从 `pyAudioAnalysis/ShortTermFeatures.py` 适配短帧能量、过零率、谱重心/通量与自相关基频；仅保留所需函数，不复制仓库/分类器，也不依赖 ASR/ML 模型。
 - [x] 以显式阈值输出 `low_arousal` / `elevated` / `uncertain`；低质量、不确定、无基频结果不得进入回应。
 - [x] 重跑该测试，检查有限值、范围和实际结果。
 
-## Task 2：音频回应门控和后台 worker
+## 任务 2：音频回应门控和后台 worker
 
-**Files:**
+**涉及文件：**
 - Create: `emotionscreen/core/audio_runtime.py`
 - Modify: `emotionscreen/core/policy.py`
 - Test: `tests/test_pipeline.py`、`tests/test_runtime.py`
 
-**Interfaces:** `AudioAnalysisWorker.submit(samples, sample_rate)`、`poll() -> list[AcousticAnalysis]`、`close()`；`AudioFeedbackPolicy.evaluate(analysis, ...) -> ResponseEvent | None`。
+**接口：** `AudioAnalysisWorker.submit(samples, sample_rate)`、`poll() -> list[AcousticAnalysis]`、`close()`；`AudioFeedbackPolicy.evaluate(analysis, ...) -> ResponseEvent | None`。
 
 - [x] 测试连续窗口从高唤醒稳定切到低唤醒才得到短时 support 事件；启动即低唤醒、高唤醒/低规则分/静音、重复、冷却、DND、暂停和已有弹窗均不触发新事件。
 - [x] 实现单线程最新任务 worker，复制提交数组、忙时只留最新快照，关闭时停止接收任务。
 - [x] 重跑音频策略与 worker 的目标测试。
 
-## Task 3：麦克风、界面与渐入反馈
+## 任务 3：麦克风、界面与渐入反馈
 
-**Files:**
+**涉及文件：**
 - Modify: `emotionscreen/config.py`、`config.json`
 - Modify: `emotionscreen/ui/window.py`、`emotionscreen/ui/comfort_window.py`
 - Modify: `tests/test_config_ui.py`
@@ -59,9 +61,9 @@
 - [x] 适配 TkAnimator 的分步 alpha/脉冲曲线与 CTkMessagebox 的拖动锚点；改用可取消的 `after`，淡入可见、静态/系统减少动态效果时直接显示。
 - [x] 运行相关配置与 UI 生命周期 smoke check；检查启动失败和关闭时释放输入/线程。
 
-## Task 4：公开音频验证、文档和交付
+## 任务 4：公开音频验证、文档和交付
 
-**Files:**
+**涉及文件：**
 - Modify: `README.md`、`docs/superpowers/specs/2026-10-08-emotiscreen-v03-design.md`
 - Optional temporary files: `%TEMP%` only; never add dataset media to Git.
 

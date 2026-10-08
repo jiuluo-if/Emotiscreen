@@ -17,7 +17,7 @@
     "timeout_seconds": 5.0
   },
   "context": {
-    "max_turns": 6
+    "max_units": 2000
   },
   "response": {
     "celebrate_cooldown_seconds": 45,
@@ -30,6 +30,6 @@
     "language": "zh-CN",
     "theme": "system",
     "reduced_motion": false,
-    "motion_strength": 0.35
+    "motion_strength": 0.72
   }
 }

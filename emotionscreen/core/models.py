@@ -50,3 +50,5 @@ class ResponseEvent:
     event_id: str
     duration_seconds: float
     language: str
+    state: str | None = None
+    persistent: bool = False

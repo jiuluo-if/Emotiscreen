@@ -13,11 +13,12 @@ from emotionscreen.core.policy import ResponsePolicy
 
 
 def test_short_context_and_mock_scenarios_fail_closed():
-    context = ConversationContext(max_turns=2)
-    context.append(TranscriptSegment("old"))
-    context.append(TranscriptSegment("middle"))
-    revision = context.append(TranscriptSegment("latest"))
+    context = ConversationContext(max_units=2)
+    context.append(TranscriptSegment("old", language="en"))
+    context.append(TranscriptSegment("middle", language="en"))
+    revision = context.append(TranscriptSegment("latest", language="en"))
     assert revision == 3 and [turn.text for turn in context.snapshot()] == ["middle", "latest"]
+    assert context.used_units == 2 and ConversationContext(max_units=2).snapshot() == ()
     with pytest.raises(ValueError):
         context.append(TranscriptSegment("partial", is_final=False))
 
@@ -39,6 +40,24 @@ def test_short_context_and_mock_scenarios_fail_closed():
     assert MockDecisionProvider().decide(arbitrary).response == "none"
 
 
+def test_session_context_counts_cjk_characters_and_english_lexical_tokens():
+    chinese = ConversationContext(max_units=5)
+    chinese.append(TranscriptSegment("甲乙丙", language="zh-CN"))
+    chinese.append(TranscriptSegment("丁戊己", language="zh-CN"))
+    assert [turn.text for turn in chinese.snapshot()] == ["丁戊己"]
+    assert chinese.used_units == 3
+
+    english = ConversationContext(max_units=4)
+    english.append(TranscriptSegment("one two", language="en"))
+    english.append(TranscriptSegment("three, four five", language="en"))
+    assert [turn.text for turn in english.snapshot()] == ["three, four five"]
+    assert english.used_units == 4
+
+    oversized = ConversationContext(max_units=3)
+    oversized.append(TranscriptSegment("one two three four", language="en"))
+    assert oversized.snapshot()[0].text == "two three four"
+
+
 def test_audio_state_transition_from_elevated_to_low_drives_support_and_silence_stays_quiet():
     sample_rate = 16_000
     seconds = 1.5
@@ -58,25 +77,27 @@ def test_audio_state_transition_from_elevated_to_low_drives_support_and_silence_
     analysis = analyzer.analyze(voice_like_tone, sample_rate)
     activated = analyzer.analyze(activated_tone, sample_rate)
     tracker = AudioStateTracker(confirmations=2)
-    policy = AudioFeedbackPolicy(clock=lambda: 100.0)
+    policy = AudioFeedbackPolicy()
     assert tracker.update(activated) is None
     high_transition = tracker.update(activated)
     assert high_transition is not None and high_transition.state == "elevated"
-    assert policy.evaluate(high_transition, now=100.0) is None
+    high_event = policy.evaluate(high_transition)
+    assert high_event is not None and high_event.state == "elevated" and high_event.action == "acknowledge" and high_event.persistent
     assert tracker.update(analysis) is None
     low_transition = tracker.update(analysis)
-    event = policy.evaluate(low_transition, now=131.0) if low_transition is not None else None
+    event = policy.evaluate(low_transition)
 
     assert analysis.quality == "usable"
     assert analysis.state == "low_arousal"
-    assert event is not None and event.action == "support"
-    assert policy.evaluate(low_transition, now=162.0) is None
-    assert AudioFeedbackPolicy().evaluate(low_transition, dnd=True, now=100.0) is None
+    assert event is not None and event.action == "support" and event.state == "low_arousal" and event.persistent
+    assert policy.evaluate(low_transition).state == "low_arousal"
+    assert AudioFeedbackPolicy().evaluate(low_transition, dnd=True) is None
     silence = analyzer.analyze(np.zeros_like(voice_like_tone), sample_rate)
     assert silence.state == "uncertain"
     assert tracker.update(silence) is None
     silence_transition = tracker.update(silence)
-    assert policy.evaluate(silence_transition, now=200.0) is None
+    neutral_event = policy.evaluate(silence_transition)
+    assert neutral_event is not None and neutral_event.action == "listen" and neutral_event.state == "uncertain" and neutral_event.persistent
 
 
 def test_public_wav_sample_can_enter_the_same_audio_pipeline(tmp_path):
