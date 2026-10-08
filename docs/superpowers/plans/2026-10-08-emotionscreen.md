@@ -8,7 +8,7 @@
 
 **技术栈：** Python 3.11+、NumPy、Tkinter、urllib、pytest；真实麦克风可选安装 sounddevice。
 
-**设计文档：** `EmotionScreen/docs/superpowers/specs/2026-10-08-emotionscreen-design.md`
+**设计文档：** `docs/superpowers/specs/2026-10-08-emotionscreen-design.md`
 
 ## 全局约束
 

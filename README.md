@@ -7,7 +7,6 @@ EmotionScreen 是一个可迁移的 Python 桌面程序骨架，用于实验语�
 运行环境：Python 3.11 或更高版本、Tkinter、NumPy。
 
 ```powershell
-cd EmotionScreen
 python -m pip install -r requirements.txt
 python main.py
 ```
