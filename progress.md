@@ -21,7 +21,7 @@
 - `python main.py --check`：Mock 与 elevated→low_arousal 合成信号反馈链路通过。
 - `git diff --check`：通过；实时 mic 硬件采集尚未测试。
 
-## 交付待办
+## 交付
 
-- 代码审查结论已无阻断项；按 `2966684515@qq.com` 和 `English: 中文内容` 格式提交。
-- 推送 `main` 并核对远端 SHA。
+- 代码审查无阻断项；以邮箱 `2966684515@qq.com`、提交信息 `feat: 接通本地声学状态与渐入安抚反馈` 创建提交 `ea74e2ad4563a2b1e09bfa7b1f974f044ff5ba98`。
+- 已推送 `main`，推送后本地/远端 SHA 一致，工作树干净。
